@@ -1,0 +1,11 @@
+[package]
+name = "bincache-index"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bincache-core = { path = "../bincache-core" }
+
+[lints]
+workspace = true

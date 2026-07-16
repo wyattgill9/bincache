@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.lints.rust]
+# deny (not forbid) so the buffer-pool and index crates can carve out
+# `#![allow(unsafe_code)]` at the module that needs it (DESIGN.md).
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Each of these = a missing fallible boundary; fix with try_from, never `as`.
+cast_possible_truncation = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"

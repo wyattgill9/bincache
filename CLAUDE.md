@@ -15,7 +15,6 @@ Legend: `>` prefer, `=` is, `¬` not, `→` leads to, `≠` not equal.
 - Shared runtime clients (HTTP/RPC/DB pools) built once at composition root, threaded. `Clone` = cheap.
 - 1 crate = 1 concept. ¬ god crates. Shared crates = canonical concepts, ¬ grab-bag.
 - Split small crates by boundary, ¬ convenience. Give every crate the smallest possible scope.
-- Workspace layout + legal dependency edges = `ARCHITECTURE.md` (tier law `base < lang < world < exec < services < app`, enforced by `scripts/layercheck.py`). New crate/code → the tier its table assigns.
 - Target-specific → small platform modules at the owner > scattered `#[cfg]`.
 - No wrapper methods that just forward. Repeated literal/path/flag → 1 named owner.
 

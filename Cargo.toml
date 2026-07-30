@@ -8,7 +8,8 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-clap = { version = "4.6", features = ["derive"] }
+clap  = { version = "4.6", features = ["derive"] }
+snafu = { version = "0.9" }
 
 [workspace.lints.rust]
 # deny (not forbid) so the buffer-pool and index crates can carve out

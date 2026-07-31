@@ -492,6 +492,48 @@ async fn the_write_path_refuses_what_it_cannot_verify() {
     assert_eq!(server.request(&head, orphan.as_bytes()).await.status, 400);
 }
 
+/// A refusal the pusher caused says why, on the wire.
+///
+/// The reason exists as the `Display` of a typed error either way. What this pins is that it
+/// reaches the client rather than only the server log, because the log belongs to the
+/// operator and the mistake belongs to whoever ran `nix copy`. The pre-compressed case is
+/// the one that matters most: it is the only refusal a correct client hits by being
+/// configured wrong rather than by being broken, and the fix is a URI setting nobody can
+/// guess from a bare `400`.
+#[compio::test]
+async fn a_client_fault_is_refused_with_its_reason() {
+    let server = Server::start("refusal-bodies").await;
+    let body = nar(b"refusal payload");
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+
+    let precompressed = server.authorized("PUT", &format!("/nar/{hash32}.nar.zst"), 2);
+    let refused = server.request(&precompressed, b"no").await;
+    assert_eq!(refused.status, 400);
+    let text = String::from_utf8(refused.body).expect("the refusal is utf8");
+    assert!(text.contains("?compression=none"), "the refusal was {text:?}");
+
+    // A hash mismatch names both hashes, so a build node's log says which artifact was
+    // wrong rather than that something was.
+    let lying = server.authorized("PUT", &format!("/nar/{hash32}.nar"), 5);
+    let mismatch = server.request(&lying, b"wrong").await;
+    assert_eq!(mismatch.status, 400);
+    let text = String::from_utf8(mismatch.body).expect("the refusal is utf8");
+    assert!(text.contains(&hash32), "the refusal was {text:?}");
+
+    // Publishing before uploading is the ordering mistake a hand-rolled pusher makes.
+    let orphan = "StorePath: /nix/store/5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j-orphan-1.0\n\
+                  URL: nar/x.nar\nCompression: none\n\
+                  FileHash: sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n\
+                  FileSize: 1\n\
+                  NarHash: sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n\
+                  NarSize: 1\nReferences: \n";
+    let head = server.authorized("PUT", "/5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j.narinfo", orphan.len());
+    let unknown = server.request(&head, orphan.as_bytes()).await;
+    assert_eq!(unknown.status, 400);
+    let text = String::from_utf8(unknown.body).expect("the refusal is utf8");
+    assert!(text.contains("has been uploaded"), "the refusal was {text:?}");
+}
+
 /// Content addressing plus an idempotent publish is what makes a client retry harmless,
 /// which matters because Nix's own HTTP store has no locking.
 #[compio::test]

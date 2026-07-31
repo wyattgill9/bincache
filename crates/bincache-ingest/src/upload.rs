@@ -46,6 +46,20 @@ pub enum Error {
     Record { source: bincache_index::index::Error },
 }
 
+impl Error {
+    /// A hash mismatch and an empty NAR are statements about the bytes the client sent.
+    /// Everything else here is the staging file, the encoder, or the index failing.
+    #[must_use]
+    pub const fn fault(&self) -> crate::fault::Fault {
+        match self {
+            Self::HashMismatch { .. } | Self::Empty => crate::fault::Fault::Client,
+            Self::Stage { .. } | Self::Compress { .. } | Self::Record { .. } => {
+                crate::fault::Fault::Server
+            }
+        }
+    }
+}
+
 /// A zstd compression level. Newtype so the valid range is checked once, at configuration
 /// time, rather than trusted at every call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

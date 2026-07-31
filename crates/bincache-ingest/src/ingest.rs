@@ -38,6 +38,22 @@ pub enum Error {
     Index { source: bincache_index::index::Error },
 }
 
+impl Error {
+    /// Every variant that describes something the push itself got wrong is a client fault,
+    /// and its message is written to be read by the person who ran `nix copy`.
+    #[must_use]
+    pub const fn fault(&self) -> crate::fault::Fault {
+        match self {
+            Self::PreCompressed { .. }
+            | Self::Narinfo { .. }
+            | Self::UnknownNar { .. }
+            | Self::NarSizeMismatch { .. } => crate::fault::Fault::Client,
+            Self::Stage { .. } | Self::Index { .. } => crate::fault::Fault::Server,
+            Self::Upload { source } => source.fault(),
+        }
+    }
+}
+
 /// What the composition root assembles an [`Ingest`] from. A struct rather than five
 /// positional arguments, so a call site cannot transpose two of them.
 pub struct Parts {

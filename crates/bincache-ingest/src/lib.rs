@@ -5,6 +5,7 @@
 //! "The ingest plane".
 
 pub mod auth;
+pub mod fault;
 pub mod ingest;
 pub mod maintain;
 pub mod upload;

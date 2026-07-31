@@ -18,6 +18,9 @@ const CACHE_INFO_TYPE: &str = "text/x-nix-cache-info";
 /// Prometheus text exposition version, for `GET /metrics`.
 const METRICS_TYPE: &str = "text/plain; version=0.0.4";
 
+/// Content type for a refusal body, which is one line of prose for a human.
+const REFUSAL_TYPE: &str = "text/plain; charset=utf-8";
+
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -62,6 +65,33 @@ pub struct Cache {
 enum Drained {
     Consumed,
     Unread,
+}
+
+/// A refused push, resolved into the two things the wire needs.
+///
+/// Building this is the one place a typed ingest error becomes a string, which is why the
+/// conversion lives here and not in the crate that raised it.
+struct Refusal {
+    status: crate::http::response::Status,
+    /// `None` for a server fault: the pusher cannot act on it, and the text names paths
+    /// inside the data directory.
+    message: Option<String>,
+}
+
+impl Refusal {
+    fn new(fault: bincache_ingest::fault::Fault, error: &dyn core::fmt::Display) -> Self {
+        match fault {
+            bincache_ingest::fault::Fault::Client => Self {
+                status: crate::http::response::Status::BadRequest,
+                // Trailing newline so the text lands cleanly in a terminal when a client
+                // does print it.
+                message: Some(format!("{error}\n")),
+            },
+            bincache_ingest::fault::Fault::Server => {
+                Self { status: crate::http::response::Status::ServerError, message: None }
+            }
+        }
+    }
 }
 
 /// One request on one connection. Bundled so the handlers below take the exchange plus at
@@ -349,9 +379,8 @@ impl Cache {
             Ok(upload) => upload,
             Err(error) => {
                 tracing::warn!(error = ?error, "refused an upload");
-                return self
-                    .answer(exchange, crate::http::response::Status::BadRequest, Drained::Unread)
-                    .await;
+                let refusal = Refusal::new(error.fault(), &error);
+                return self.refuse(exchange, refusal, Drained::Unread).await;
             }
         };
         self.proceed(exchange).await?;
@@ -372,9 +401,8 @@ impl Cache {
                 // The staging file goes away with the dropped upload; nothing durable
                 // was ever named after unverified bytes.
                 tracing::warn!(error = ?error, "upload failed verification");
-                return self
-                    .answer(exchange, crate::http::response::Status::BadRequest, Drained::Consumed)
-                    .await;
+                let refusal = Refusal::new(error.fault(), &error);
+                return self.refuse(exchange, refusal, Drained::Consumed).await;
             }
         };
         verified.store(self.ingest.store(), self.ingest.index()).await.context(UploadSnafu)?;
@@ -414,9 +442,8 @@ impl Cache {
         };
         if let Err(error) = self.ingest.publish(&text) {
             tracing::warn!(error = ?error, "refused a narinfo");
-            return self
-                .answer(exchange, crate::http::response::Status::BadRequest, Drained::Consumed)
-                .await;
+            let refusal = Refusal::new(error.fault(), &error);
+            return self.refuse(exchange, refusal, Drained::Consumed).await;
         }
         self.answer(exchange, crate::http::response::Status::Created, Drained::Consumed).await
     }
@@ -460,6 +487,32 @@ impl Cache {
             if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
         let head = crate::http::response::bare(status, keep_alive, 0);
         exchange.connection.write(head).await.context(ConnectionSnafu)?;
+        Ok(keep_alive)
+    }
+
+    /// A refusal, carrying its reason when the reason is the client's to act on.
+    ///
+    /// A `PUT` whose body was never read still gets the message before the connection
+    /// closes, which is the case that matters: the largest refusal is a pre-compressed NAR,
+    /// and answering it early is the whole point of not reading the upload first.
+    async fn refuse(
+        &self,
+        exchange: &mut Exchange<'_, '_>,
+        refusal: Refusal,
+        drained: Drained,
+    ) -> Result<crate::http::KeepAlive, Error> {
+        let Refusal { status, message } = refusal;
+        let Some(message) = message else {
+            return self.answer(exchange, status, drained).await;
+        };
+
+        let unread = drained == Drained::Unread && exchange.request.body_len() > 0;
+        let keep_alive =
+            if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
+        let mut head = crate::http::response::Head::new(status, keep_alive);
+        head.header("Content-Type", REFUSAL_TYPE);
+        let bytes = head.with_body(message.as_bytes());
+        exchange.connection.write(bytes).await.context(ConnectionSnafu)?;
         Ok(keep_alive)
     }
 

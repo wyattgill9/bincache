@@ -52,6 +52,18 @@ pub struct Cache {
     stats: crate::stats::Shards,
 }
 
+/// Whether the request's body has been read off the socket.
+///
+/// A bodyless answer to a request whose body is still in flight has to close the
+/// connection, or the next request on it would start mid-message. A request whose body was
+/// consumed keeps the connection, which is what lets `nix copy` push a whole closure over
+/// one connection instead of reconnecting per path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drained {
+    Consumed,
+    Unread,
+}
+
 /// One request on one connection. Bundled so the handlers below take the exchange plus at
 /// most the one decoded value their route carries.
 pub struct Exchange<'a, 'head> {
@@ -85,13 +97,17 @@ impl Cache {
         crate::stats::Shard::bump(&self.stats.get(exchange.shard).requests, 1);
 
         if exchange.request.framing == crate::http::Framing::Chunked {
-            return self.answer(exchange, crate::http::response::Status::NotImplemented).await;
+            return self
+                .answer(exchange, crate::http::response::Status::NotImplemented, Drained::Unread)
+                .await;
         }
 
         let route = match crate::route::resolve(exchange.request.target) {
             Ok(route) => route,
             Err(crate::route::Error::Unknown { .. }) => {
-                return self.answer(exchange, crate::http::response::Status::NotFound).await;
+                return self
+                    .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
+                    .await;
             }
             Err(error) => {
                 tracing::debug!(
@@ -99,7 +115,9 @@ impl Cache {
                     error = ?error,
                     "unroutable request"
                 );
-                return self.answer(exchange, crate::http::response::Status::BadRequest).await;
+                return self
+                    .answer(exchange, crate::http::response::Status::BadRequest, Drained::Unread)
+                    .await;
             }
         };
 
@@ -153,7 +171,9 @@ impl Cache {
         let stats = self.stats.get(exchange.shard);
         let Some(record) = self.ingest.index().narinfo(&key).context(IndexSnafu)? else {
             crate::stats::Shard::bump(&stats.metadata_misses, 1);
-            return self.answer(exchange, crate::http::response::Status::NotFound).await;
+            return self
+                .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
+                .await;
         };
         crate::stats::Shard::bump(&stats.metadata_hits, 1);
 
@@ -201,7 +221,9 @@ impl Cache {
         };
 
         let Some(length) = length else {
-            return self.answer(exchange, crate::http::response::Status::NotFound).await;
+            return self
+                .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
+                .await;
         };
         let mut head = crate::http::response::Head::new(
             crate::http::response::Status::Ok,
@@ -220,14 +242,18 @@ impl Cache {
         url: &bincache_core::narurl::NarUrl,
     ) -> Result<crate::http::KeepAlive, Error> {
         let Some(reader) = self.ingest.store().read(url).await.context(StoreSnafu)? else {
-            return self.answer(exchange, crate::http::response::Status::NotFound).await;
+            return self
+                .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
+                .await;
         };
         let size = reader.size();
         if size == 0 {
             // Ingest refuses an empty NAR, so a zero-length artifact means a truncated file
             // on disk rather than something a client did.
             tracing::error!(name = url.name(), "artifact on disk is empty");
-            return self.answer(exchange, crate::http::response::Status::ServerError).await;
+            return self
+                .answer(exchange, crate::http::response::Status::ServerError, Drained::Unread)
+                .await;
         }
 
         let span = match crate::range::resolve(exchange.request.range, size) {
@@ -309,17 +335,23 @@ impl Cache {
     ) -> Result<crate::http::KeepAlive, Error> {
         if self.admit(exchange.shard, exchange.request) == bincache_ingest::auth::Admission::Denied
         {
-            return self.answer(exchange, crate::http::response::Status::Unauthorized).await;
+            return self
+                .answer(exchange, crate::http::response::Status::Unauthorized, Drained::Unread)
+                .await;
         }
         let crate::http::Framing::Length(mut remaining) = exchange.request.framing else {
-            return self.answer(exchange, crate::http::response::Status::LengthRequired).await;
+            return self
+                .answer(exchange, crate::http::response::Status::LengthRequired, Drained::Unread)
+                .await;
         };
 
         let mut upload = match self.ingest.receive(url).await {
             Ok(upload) => upload,
             Err(error) => {
                 tracing::warn!(error = ?error, "refused an upload");
-                return self.answer(exchange, crate::http::response::Status::BadRequest).await;
+                return self
+                    .answer(exchange, crate::http::response::Status::BadRequest, Drained::Unread)
+                    .await;
             }
         };
         self.proceed(exchange).await?;
@@ -340,13 +372,15 @@ impl Cache {
                 // The staging file goes away with the dropped upload; nothing durable
                 // was ever named after unverified bytes.
                 tracing::warn!(error = ?error, "upload failed verification");
-                return self.answer(exchange, crate::http::response::Status::BadRequest).await;
+                return self
+                    .answer(exchange, crate::http::response::Status::BadRequest, Drained::Consumed)
+                    .await;
             }
         };
         verified.store(self.ingest.store(), self.ingest.index()).await.context(UploadSnafu)?;
 
         crate::stats::Shard::bump(&self.stats.get(exchange.shard).uploads, 1);
-        self.answer(exchange, crate::http::response::Status::Created).await
+        self.answer(exchange, crate::http::response::Status::Created, Drained::Consumed).await
     }
 
     /// `PUT <hash>.narinfo`, the metadata half of a push, and the publish.
@@ -356,25 +390,35 @@ impl Cache {
     ) -> Result<crate::http::KeepAlive, Error> {
         if self.admit(exchange.shard, exchange.request) == bincache_ingest::auth::Admission::Denied
         {
-            return self.answer(exchange, crate::http::response::Status::Unauthorized).await;
+            return self
+                .answer(exchange, crate::http::response::Status::Unauthorized, Drained::Unread)
+                .await;
         }
         let crate::http::Framing::Length(length) = exchange.request.framing else {
-            return self.answer(exchange, crate::http::response::Status::LengthRequired).await;
+            return self
+                .answer(exchange, crate::http::response::Status::LengthRequired, Drained::Unread)
+                .await;
         };
         if length > crate::http::METADATA_BODY_MAX {
-            return self.answer(exchange, crate::http::response::Status::ContentTooLarge).await;
+            return self
+                .answer(exchange, crate::http::response::Status::ContentTooLarge, Drained::Unread)
+                .await;
         }
         self.proceed(exchange).await?;
 
         let body = exchange.connection.body(length).await.context(ConnectionSnafu)?;
         let Ok(text) = String::from_utf8(body) else {
-            return self.answer(exchange, crate::http::response::Status::BadRequest).await;
+            return self
+                .answer(exchange, crate::http::response::Status::BadRequest, Drained::Consumed)
+                .await;
         };
         if let Err(error) = self.ingest.publish(&text) {
             tracing::warn!(error = ?error, "refused a narinfo");
-            return self.answer(exchange, crate::http::response::Status::BadRequest).await;
+            return self
+                .answer(exchange, crate::http::response::Status::BadRequest, Drained::Consumed)
+                .await;
         }
-        self.answer(exchange, crate::http::response::Status::Created).await
+        self.answer(exchange, crate::http::response::Status::Created, Drained::Consumed).await
     }
 
     /// Answers `Expect: 100-continue` once the request is known to be acceptable. curl sets
@@ -404,18 +448,16 @@ impl Cache {
         admission
     }
 
-    /// A bodyless answer. A request that announced a body it will not get to send has its
-    /// connection closed, so the next request never starts mid-message.
+    /// A bodyless answer.
     async fn answer(
         &self,
         exchange: &mut Exchange<'_, '_>,
         status: crate::http::response::Status,
+        drained: Drained,
     ) -> Result<crate::http::KeepAlive, Error> {
-        let keep_alive = if exchange.request.body_len() > 0 {
-            crate::http::KeepAlive::Close
-        } else {
-            exchange.request.keep_alive
-        };
+        let unread = drained == Drained::Unread && exchange.request.body_len() > 0;
+        let keep_alive =
+            if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
         let head = crate::http::response::bare(status, keep_alive, 0);
         exchange.connection.write(head).await.context(ConnectionSnafu)?;
         Ok(keep_alive)

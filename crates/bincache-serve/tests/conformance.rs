@@ -524,6 +524,55 @@ async fn one_connection_serves_many_requests() {
     }
 }
 
+/// A push is two requests per path, and a closure is hundreds of paths. Answering a
+/// consumed body with a close would make `nix copy` reconnect for every one of them.
+#[compio::test]
+async fn a_whole_push_fits_on_one_connection() {
+    let server = Server::start("push-keep-alive").await;
+    let mut stream = server.connect().await;
+
+    for seed in [b"first path".as_slice(), b"second path".as_slice()] {
+        let body = nar(seed);
+        let nar_hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+        let digest = bincache_core::hash::Sha256::digest(seed);
+        let mut raw = [0u8; bincache_core::storepath::HASH_WIDTH];
+        raw.copy_from_slice(&digest.as_bytes()[..bincache_core::storepath::HASH_WIDTH]);
+        let key = bincache_core::storepath::Hash::from_bytes(raw).to_string();
+
+        let head = server.authorized("PUT", &format!("/nar/{nar_hash32}.nar"), body.len());
+        assert_eq!(exchange(&mut stream, &head, &body).await.status, 201);
+
+        let narinfo = format!(
+            "StorePath: /nix/store/{key}-conformance-1.0\nURL: nar/{nar_hash32}.nar\n\
+             Compression: none\nFileHash: sha256:{nar_hash32}\nFileSize: {}\n\
+             NarHash: sha256:{nar_hash32}\nNarSize: {}\nReferences: \n",
+            body.len(),
+            body.len()
+        );
+        let head = server.authorized("PUT", &format!("/{key}.narinfo"), narinfo.len());
+        assert_eq!(exchange(&mut stream, &head, narinfo.as_bytes()).await.status, 201);
+
+        let get = format!("GET /{key}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert_eq!(exchange(&mut stream, &get, b"").await.status, 200);
+    }
+}
+
+/// A request whose body is refused unread must close, or the next request on the
+/// connection would start mid-message.
+#[compio::test]
+async fn a_refused_body_closes_the_connection() {
+    let server = Server::start("refused-body").await;
+    let body = nar(b"unauthorized payload");
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+    let head = format!(
+        "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let response = server.request(&head, &body).await;
+    assert_eq!(response.status, 401);
+    assert_eq!(response.header("Connection"), Some("close"));
+}
+
 #[compio::test]
 async fn a_connection_close_request_is_honoured() {
     let server = Server::start("close").await;

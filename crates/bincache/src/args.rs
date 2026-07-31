@@ -91,7 +91,12 @@ pub struct Serve {
     pub priority: u32,
 
     /// Whether `nix-cache-info` invites bulk narinfo queries.
-    #[arg(long, env = "BINCACHE_WANT_MASS_QUERY", default_value_t = true)]
+    ///
+    /// Takes its value rather than being a bare flag. A `bool` field defaults to
+    /// `SetTrue`, which combined with a `true` default leaves `WantMassQuery: 0`
+    /// unreachable: passing the flag and omitting it would both mean the same thing.
+    #[arg(long, env = "BINCACHE_WANT_MASS_QUERY", action = clap::ArgAction::Set,
+          default_value_t = true)]
     pub want_mass_query: bool,
 
     /// How long a shard may go without a heartbeat before the watchdog says so.

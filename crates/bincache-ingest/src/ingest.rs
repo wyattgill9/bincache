@@ -36,29 +36,6 @@ pub enum Error {
 
     #[snafu(display("the index rejected the write"))]
     Index { source: bincache_index::index::Error },
-
-    #[snafu(display("the artifact could not be unlinked"))]
-    Unlink { source: bincache_store::nar::Error },
-
-    #[snafu(display("the payload directory could not be listed"))]
-    Scan { source: bincache_store::nar::Error },
-}
-
-/// Whether an operator delete found anything.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Deleted {
-    Removed,
-    Absent,
-}
-
-/// What a reconciliation pass found. Artifacts with no record are deletable; records with
-/// no artifact are a louder problem, because a client that resolved the narinfo will ask
-/// for bytes that are not there.
-#[derive(Debug, Default)]
-pub struct Reconciliation {
-    pub orphan_artifacts: Vec<bincache_core::narurl::NarUrl>,
-    pub records_without_artifacts: Vec<bincache_core::storepath::Path>,
-    pub unrecognized_files: Vec<std::path::PathBuf>,
 }
 
 /// What the composition root assembles an [`Ingest`] from. A struct rather than five
@@ -159,55 +136,6 @@ impl Ingest {
         self.index.publish(&record).context(IndexSnafu)?;
         tracing::info!(path = %record.store_path, "published");
         Ok(record)
-    }
-
-    /// Operator-triggered delete: forget the record, then unlink the artifact. An in-flight
-    /// stream holds its descriptor, so an unlinked file finishes streaming safely.
-    pub async fn delete(&self, key: &bincache_core::storepath::Hash) -> Result<Deleted, Error> {
-        let Some(record) = self.index.unpublish(key).context(IndexSnafu)? else {
-            return Ok(Deleted::Absent);
-        };
-        self.store.remove(&record.nar()).await.context(UnlinkSnafu)?;
-        tracing::info!(path = %record.store_path, "deleted");
-        Ok(Deleted::Removed)
-    }
-
-    /// Re-signs every record under the current key. Clients see no interruption as long as
-    /// both public keys sit in `trusted-public-keys` for the duration.
-    pub fn rotate(&self) -> Result<usize, Error> {
-        let records = self.index.records().context(IndexSnafu)?;
-        let rotated = records.len();
-        for mut record in records {
-            record.resign(&self.dir, &self.key);
-            self.index.publish(&record).context(IndexSnafu)?;
-        }
-        Ok(rotated)
-    }
-
-    /// Compares the filesystem against the index in both directions. Reports rather than
-    /// acts, because deleting is an operator decision.
-    pub fn reconcile(&self) -> Result<Reconciliation, Error> {
-        let scan = self.store.scan().context(ScanSnafu)?;
-        let records = self.index.records().context(IndexSnafu)?;
-
-        let claimed: std::collections::HashSet<String> =
-            records.iter().map(|record| record.nar().name()).collect();
-        let present: std::collections::HashSet<String> =
-            scan.artifacts.iter().map(bincache_core::narurl::NarUrl::name).collect();
-
-        let orphan_artifacts =
-            scan.artifacts.iter().filter(|url| !claimed.contains(&url.name())).copied().collect();
-        let records_without_artifacts = records
-            .into_iter()
-            .filter(|record| !present.contains(&record.nar().name()))
-            .map(|record| record.store_path)
-            .collect();
-
-        Ok(Reconciliation {
-            orphan_artifacts,
-            records_without_artifacts,
-            unrecognized_files: scan.unrecognized,
-        })
     }
 }
 
@@ -358,10 +286,18 @@ mod tests {
         let record = ingest.publish(&client_narinfo(&body)).expect("publishes");
 
         let key = *record.store_path.hash();
-        assert_eq!(ingest.delete(&key).await.expect("deletes"), crate::ingest::Deleted::Removed);
-        assert!(ingest.index().narinfo(&key).expect("reads").is_none());
-        assert!(ingest.store().read(&record.nar()).await.expect("reads").is_none());
-        assert_eq!(ingest.delete(&key).await.expect("deletes"), crate::ingest::Deleted::Absent);
+        let store = ingest.store();
+        let index = ingest.index();
+        assert_eq!(
+            crate::maintain::delete(store, index, &key).await.expect("deletes"),
+            crate::maintain::Deleted::Removed
+        );
+        assert!(index.narinfo(&key).expect("reads").is_none());
+        assert!(store.read(&record.nar()).await.expect("reads").is_none());
+        assert_eq!(
+            crate::maintain::delete(store, index, &key).await.expect("deletes"),
+            crate::maintain::Deleted::Absent
+        );
     }
 
     #[compio::test]
@@ -370,12 +306,14 @@ mod tests {
         let body = b"nix-archive-1 unclaimed".repeat(10);
         upload(&ingest, &body).await;
 
-        let reconciliation = ingest.reconcile().expect("reconciles");
+        let reconciliation =
+            crate::maintain::reconcile(ingest.store(), ingest.index()).expect("reconciles");
         assert_eq!(reconciliation.orphan_artifacts.len(), 1);
         assert!(reconciliation.records_without_artifacts.is_empty());
 
         ingest.publish(&client_narinfo(&body)).expect("publishes");
-        let reconciliation = ingest.reconcile().expect("reconciles");
+        let reconciliation =
+            crate::maintain::reconcile(ingest.store(), ingest.index()).expect("reconciles");
         assert!(reconciliation.orphan_artifacts.is_empty());
         assert!(reconciliation.records_without_artifacts.is_empty());
     }
@@ -387,9 +325,15 @@ mod tests {
         upload(&ingest, &body).await;
         ingest.publish(&client_narinfo(&body)).expect("publishes");
 
-        assert_eq!(ingest.rotate().expect("rotates"), 1);
+        let key = bincache_core::sign::SecretKey::generate("bincache-test-2".to_owned());
+        let rotated = crate::maintain::rotate(ingest.index(), ingest.dir(), &key).expect("rotates");
+        assert_eq!(rotated, 1);
         for record in ingest.index().records().expect("lists") {
             assert_eq!(record.sigs.len(), 1);
+            assert_eq!(record.sigs[0].name(), "bincache-test-2");
+            key.public()
+                .verify(&record.fingerprint(ingest.dir()), &record.sigs[0])
+                .expect("verifies under the new key");
         }
     }
 }

@@ -668,6 +668,85 @@ Stated as targets to measure, not as results:
 - **`bitcode` for the on-disk record format.** Fast, but its encoding is not stable across
   versions. [[rkyv]] for anything durable.
 
+## What v1 shipped, and where it departs from the above
+
+Written after building it. Everything here is a decision the document did not make, or made
+differently, and the reason the code went the other way.
+
+### The write protocol, resolved
+
+The document said `PUT` plus bearer tokens and left the rest implicit. Building it forced
+the question of what exactly a client sends, and the answer settles a real ambiguity.
+
+`nix copy --to` uploads the NAR first and the narinfo second, and it compresses
+client-side. That collides with `receive → verify → compress → store`: if the client
+compressed, the bytes on the wire are not the bytes `NarHash` describes, so the server
+cannot verify anything. **v1 therefore requires `?compression=none` on the client's store
+URI** and refuses a pre-compressed upload with a message naming the setting. The cache
+still stores zstd; it produces that itself.
+
+That constraint turns out to buy the verification story rather than cost it. With no client
+compression the upload target is `nar/<nar hash>.nar`, so **the request URL states what its
+own body must hash to**. Verification happens during receive, against the request rather
+than against a later claim, and a mismatch aborts before anything durable is named. The
+narinfo `PUT` then supplies only what the server cannot compute: store path, references,
+deriver, `CA`. Every field describing the payload comes from what was received.
+
+**`HEAD` on an uncompressed NAR URL is answered from the NAR-hash index, not the
+filesystem.** `BinaryCacheStore::addToStore` probes the URL it is about to upload to, but
+bincache stores a recompressed artifact under a different name, so the file is not there
+under the name the client asks about. Answering `404` would make every build node re-upload
+every NAR forever. This is the one place a `HEAD` does not describe the `GET` of the same
+URL, and it is deliberate.
+
+### Deviations from the design as written
+
+- **Atomic appearance is staging plus `rename`, not `O_TMPFILE` plus `linkat`.** Both give
+  "appears whole or not at all". `linkat(AT_EMPTY_PATH)` on an `O_TMPFILE` descriptor needs
+  privilege on many kernels, and it is Linux-only, which would have made the durability
+  primitive untestable off Linux. A crash leaves a staging file rather than nothing; the
+  boot sweep collects it, so the recovery story is unchanged.
+- **Ingest runs on the shard that accepted the `PUT`, not on dedicated cores.** Compression
+  is chunked with a scheduler yield between chunks, the same discipline the payload plane
+  uses. Dedicated ingest cores need a cross-thread buffer handoff, and the design's own rule
+  is that an unmeasured optimization is a bug in the charter. Uploads are authenticated and
+  rare; this is the thing to measure first if push latency ever matters.
+- **`arc-swap` is not a dependency.** It was named for publishing the RAM projection, and
+  the projection is deferred, so there is nothing to swap. It returns with the projection.
+- **`rkyv` runs `unaligned` and `little_endian`.** `redb` hands back a byte slice at
+  whatever alignment its page put it, and validating an archive in place needs alignment 1
+  to avoid a copy on every read. `little_endian` keeps the on-disk format from changing
+  meaning on a different target, which is the same reasoning as the acquire/release rule.
+- **`hegel` is not used.** The crate by that name on crates.io is an AWS Lambda payload
+  library, not a property-testing framework. Property-shaped tests are written as
+  deterministic loops over a seeded generator, so a failure is reproducible from the seed.
+- **Maintenance is a separate module from the serving-path writer.** A delete needs no
+  signing key and no compression level; folding it into the ingest object forced every
+  caller to invent values it never used.
+- **`redb` allows one writer process**, so `delete`, `reconcile`, and `rotate` need the
+  server stopped. Stated in `--help` and in the error.
+
+### What the build found that the document did not predict
+
+- **An empty `References` line must keep its trailing space.** `NarInfo::to_string` writes
+  the literal `"References: "` before joining, and `NarInfo::NarInfo` reads every value from
+  two characters past the colon. A bare `References:` leaves a client nothing to read. The
+  conformance suite caught this on its first run; nothing in the field list suggested it.
+- **A heartbeat written in the accept loop reports every idle shard as stalled.** A shard
+  parked in `accept` with no traffic is indistinguishable from a wedged one if the loop is
+  what updates the timestamp. The heartbeat runs on a timer task instead, which only fails
+  to fire when something is monopolizing that shard's executor, which is the condition worth
+  reporting. A timestamp also cannot express "never started", since a shard that beat
+  immediately reads the same as one that never did, so a beat count sits beside it.
+- **`Expect: 100-continue` is not optional.** curl sets it on uploads past about a kilobyte
+  and stalls for a second per upload if nothing answers.
+
+### Deferred, unchanged from the plan above
+
+The RAM projection, the binary fuse filter, huge pages, TLS, HTTP/2, garbage collection,
+S3-compatible ingest, `loom`, and kTLS. Each is deferred for the reason given in its own
+section, not for lack of time.
+
 ## Still open
 
 - **HTTP/2, which is now the top of the queue rather than a vague someday.** Hand-rolled

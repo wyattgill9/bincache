@@ -1,28 +1,27 @@
 # bincache-store
 
-The filesystem as ground truth. Everything in RAM is a cache of what this crate owns.
+The filesystem as the payload database. Artifacts are immutable and content-addressed, so
+recovery never has to answer "which version", only "present or absent".
 
 ## Owns
 
-- **On-disk layout and naming.** Content-addressed NAR files at `nar/<filehash>.nar.zst`
-  under a flat sharded directory tree, the per-path narinfo metadata records that response
-  blobs are regenerated from during a signing-key rotation, the append-only publish log,
-  and the `rkyv` index snapshot files.
-- **Durability primitives.** Stream into `O_TMPFILE`, `fsync`, then `linkat` to the
-  content-addressed name, so a path appears atomically or not at all. A crash leaves
-  either nothing or an orphan file, which makes a client retry a no-op.
-- **Recovery inputs.** Log append and log-tail replay, plus the O(n) filesystem rescan
-  that boot falls back to when a snapshot or log fails validation.
-- **Read-side file access.** The `statx`-enriched open whose descriptor `bincache-serve`
-  streams from. An unlinked file finishes streaming safely because the fd holds it.
-- **Cold maintenance scans.** GC and integrity re-verification, which must use
-  `POSIX_FADV_DONTNEED` or `O_DIRECT` so they do not evict the page cache that serves
-  traffic.
+- **On-disk layout.** `nar/<shard>/<file hash>.nar.zst`, where the shard is the leading
+  characters of the name. The served URL stays flat; the split is private to the
+  filesystem.
+- **Atomic appearance.** An upload streams into a staging file, is `fsync`ed, then renamed
+  into its content-addressed name. It appears whole or not at all. A crash leaves a staging
+  file rather than a half-artifact, and the boot sweep collects those.
+- **Read-side access.** An open handle plus the size a `Content-Length` needs. The
+  descriptor keeps the file alive across an unlink, so a delete during a stream finishes
+  the stream safely and POSIX does the reference counting.
+- **Reconciliation input.** The scan that lists what is actually on disk, separating names
+  that parse from names that do not, since an unparseable name means something other than
+  bincache wrote there.
 
 ## Does not own
 
-Any in-RAM index state, and any policy about what to evict. It performs the unlink; it
-does not decide it.
+Any in-RAM index state, and any policy about what to evict. It performs the unlink; it does
+not decide it.
 
 ## Depends on
 
@@ -30,9 +29,10 @@ does not decide it.
 
 ## Notes
 
-The syscall surface beyond sockets lives here, through `rustix` on the linux_raw backend.
+Placement is staging plus `rename` rather than `O_TMPFILE` plus `linkat`. Both give atomic
+appearance; `linkat(AT_EMPTY_PATH)` needs privilege on many kernels and is Linux-only,
+which would make the durability primitive untestable elsewhere.
 
 ## Design references
 
-DESIGN.md: "The Payload Plane", "Durability and Recovery", "Pipeline as a typestate
-machine".
+DESIGN_V2.md: "The payload plane", "Durability and recovery", "Retention".

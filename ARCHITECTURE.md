@@ -1,35 +1,36 @@
 # bincache: how the parts fit
 
 Orientation doc. Read this to reload the whole system into your head, then go to
-`research/DESIGN.md` for the reasoning behind any single decision.
+`research/DESIGN_V2.md` for the reasoning behind any single decision.
 
 ## Current state
 
-Nothing is implemented. All five `lib.rs` files are empty; `crates/bincache/src/main.rs`
-is a `clap` parse that prints a greeting. The system described below exists as prose in
-`research/DESIGN.md` and the six crate READMEs.
+V1 is implemented and serves the protocol end to end. A `nix copy --to` push lands, a
+`GET` of the narinfo returns a signed record, and the NAR streams back and decompresses to
+what was uploaded. `crates/bincache-serve/tests/conformance.rs` runs a real shard on a real
+socket and asserts that; `scripts/conformance.py` does the same against a running process,
+including verifying the ed25519 signature the way a client verifies it.
 
-That is worth stating plainly: the architecture is designed about three layers deeper than
-it is built, so there is no code to anchor any of it against. This file is the anchor
-until there is.
+Deferred on purpose, with the reasoning in `research/DESIGN_V2.md`: the RAM projection in
+front of `redb`, TLS, HTTP/2, garbage collection, and the negative-lookup filter tier.
 
 ## The one sentence
 
-A narinfo response is fully built at upload time and stored in RAM as finished bytes.
-Serving it is a hash lookup plus one write.
+A narinfo body and its signature are computed once, at upload time, from fields the server
+verified itself. Serving one is a key lookup plus a render plus a write.
 
 Everything else is one of three things:
 
-1. Making that lookup fast (index structure, hasher, filter tier, huge pages).
-2. Getting NAR bytes to the socket without copying them (splice, page cache, no O_DIRECT).
-3. Making the RAM state rebuildable from disk after a crash (snapshot, log, rescan).
+1. Making that lookup fast (the KV store now, a derived RAM projection later).
+2. Getting NAR bytes to the socket in bounded chunks without buffering the whole artifact.
+3. Making sure a crash leaves either nothing or an orphan file, never a lie.
 
 ## Three planes
 
 | Plane | Question it answers | Crates |
 |---|---|---|
-| Metadata | "Do you have path X, and what is it?" | `index`, with bytes from `core` |
-| Payload | "Give me the NAR." | `store` opens the fd, `serve` splices it |
+| Metadata | "Do you have path X, and what is it?" | `index`, rendering with `core` |
+| Payload | "Give me the NAR." | `store` opens the file, `serve` streams it |
 | Ingest | "Here is a new path." | `ingest`, driving `core`, `store`, `index` |
 
 The metadata plane is miss-dominated: a client resolving a 500-path closure asks about all
@@ -41,23 +42,24 @@ planes are engineered separately, and that split is the organizing decision of t
 
 Crates split by who owns what, not by feature.
 
-- **`bincache-core`** is the vocabulary and the pure functions. `StorePathHash`,
-  `NarHash`, `Signature`, narinfo render, ed25519 sign, base32 decode. No I/O, no async,
-  no sibling deps. The only crate all five others agree on.
-- **`bincache-index`** is RAM. Hash to a pointer into a huge-page arena of pre-rendered
-  blobs, published through a snapshot pointer.
-- **`bincache-store`** is disk. Files, `O_TMPFILE`, `fsync`, `linkat`, the publish log,
-  the `rkyv` snapshots. Ground truth.
-- **`bincache-ingest`** is the only writer.
-- **`bincache-serve`** is the readers. Holds a snapshot pointer and some file descriptors,
-  nothing else.
+- **`bincache-core`** is the vocabulary and the pure functions. Nix base32, `hash::Sha256`,
+  `storepath::{Hash, Path, Dir}`, the `narinfo::NarInfo` record with its render, parse, and
+  fingerprint, ed25519 keys and signatures, and `narurl` as the single owner of the
+  `nar/<file hash>.nar<ext>` convention in both directions. No I/O, no async, no sibling
+  deps.
+- **`bincache-index`** is the `redb` schema. Two tables, `rkyv`-encoded values.
+- **`bincache-store`** is the filesystem: content-addressed artifacts, atomic appearance,
+  reader handles, and the scan that finds orphans.
+- **`bincache-ingest`** is the only writer. The typestate upload machine, the publish, push
+  auth, and the maintenance operations.
+- **`bincache-serve`** is the readers: shards, HTTP/1.1, routing, ranges, counters.
 - **`bincache`** is wiring. The only crate that knows the other five exist together.
 
 Dependency direction, which is also the layering:
 
 ```
-core  <-  index  <-  ingest  <-  bincache
-  ^         ^     <-  serve   <-
+core  <-  index  <-  ingest  <-  serve  <-  bincache
+  ^         ^     <-  store   <-      <-
   |         |
   +-- store +
 ```
@@ -66,91 +68,77 @@ core  <-  index  <-  ingest  <-  bincache
 
 ### `GET /<hash>.narinfo`, the hot path
 
-1. `serve` reads the socket into a pool-owned buffer and parses HTTP/1.1 by hand.
-2. `serve` decodes the 32-character base32 key into `core::StorePathHash([u8; 20])`.
-   Malformed input dies here with a 400, before touching any data structure.
-3. `serve` loads the `index` snapshot pointer with `Acquire`.
-4. `index` checks the delta tier, then the frozen tier, yielding `(ptr, len)` into the
-   arena. Later, a binary fuse filter short-circuits definite misses before this step.
-5. `serve` writes those bytes. One vectored write of an immutable buffer.
+1. `serve` reads the socket into the connection's buffer and parses HTTP/1.1 by hand.
+2. `route` decodes the 32-character base32 key into `core::storepath::Hash`. Malformed
+   input dies here with a 400, before touching any data structure.
+3. `index` reads the record out of `redb`.
+4. `core` renders the body from the record's fields.
+5. `serve` builds the framing and writes head and body in one buffer.
 
-No allocation, no formatting, no lock, and no shared cache-line write anywhere in that
-list. That absence is the design goal.
-
-`HEAD` reuses the header segment of the same blob.
+`HEAD` renders the same body, reports its length, and writes no body. That is the whole
+reason the stored artifact is a *body* rather than a framed response: HTTP/2 becomes a
+change to `serve` rather than a data migration.
 
 ### `GET /nar/<filehash>.nar.zst`
 
 1. Same parse and decode.
-2. `store` performs the `statx`-enriched open and hands over a descriptor.
-3. `serve` loops bounded zero-copy sends, yielding to the scheduler between chunks so one
-   elephant stream cannot monopolize its shard.
+2. `store` opens the file and reports its size.
+3. `range` resolves any `Range` header against that size.
+4. `serve` loops bounded reads and writes through one reused buffer, handing the shard back
+   to its scheduler between chunks so one elephant stream cannot monopolize it.
 
-Userspace never sees a NAR byte. The page cache is the payload cache.
+Every NAR response carries `Accept-Ranges: bytes` and no `Content-Encoding`. Both are
+required for a dropped transfer to resume rather than restart, and both are asserted by a
+conformance test.
 
 ### `PUT`, the ingest chain
 
-Encoded as a typestate machine, each transition consuming `self`:
+A client pushes the payload first, then the metadata.
 
 ```
-Upload<Receiving>   stream into O_TMPFILE, hash incrementally
-Upload<Verified>    declared NarHash matched, else abort before anything durable exists
-Upload<Compressed>  zstd
-Upload<Stored>      fsync, then linkat to nar/<filehash>.nar.zst
-Published           core renders and signs the blob; index bump-allocates it into the
-                    arena and swaps the snapshot pointer with Release
+PUT /nar/<nar hash>.nar         the target states what the body must hash to
+  Upload<Receiving>    stream in, hash the NAR, zstd-compress toward staging
+  Upload<Compressed>   encoder flushed; both hashes and both sizes final
+  Upload<Verified>     the computed hash matched the target, else abort
+  nar::Entry           fsync, rename to nar/<file hash>.nar.zst, record it
+
+PUT /<hash>.narinfo             the publish
+  parse, look up the NAR entry, take every payload field from what was received,
+  discard the client's signatures, sign, commit
 ```
 
-`publish()` exists only on the state whose verify and sign steps have run, so serving
-unverified content is a compile error rather than a review catch. A crash at any point
-leaves either nothing or an orphan file, which is what makes a client retry a no-op.
+Each transition consumes `self`, and `store` exists only on `Upload<Verified>`, so
+committing unverified content is a compile error. A crash at any point leaves either
+nothing or an orphan artifact, which is what makes a client retry a no-op.
+
+The client must be pointed at the cache with `?compression=none`: bincache verifies the NAR
+hash the protocol defines, over the bytes the protocol defines, and compresses on receipt.
+A pre-compressed upload is refused with a message naming the setting.
 
 ### Boot
 
-`bincache` parses config, `store` maps the latest `rkyv` snapshot through the checked API,
-`index` builds from it, `store` replays the publish log tail, `serve` starts listeners. A
-snapshot that fails validation degrades to an O(n) filesystem rescan: slow boot, no data
-loss.
+Open the payload directory and the `redb` file, sweep staging files a crash may have left,
+start the watchdog, start the shards. There is no snapshot to validate and no log to
+replay: a `redb` commit is the publish.
 
 ## The two connectors
 
 If you retain nothing else, retain these.
 
-**The pre-rendered response blob.** `core` makes it, `index` stores it in the arena and
-points at it, `serve` writes it verbatim, `store` persists the metadata that regenerates
-it during key rotation, `ingest` orchestrates the chain. It is the object every crate
-touches.
+**The verified record.** `ingest` produces it from bytes it hashed itself, `core` renders
+and signs it, `index` stores it, `serve` renders it again per request. Every field
+describing the payload comes from what arrived, never from what the client claimed.
 
-**The snapshot pointer.** The only cross-core communication on the read path: one
-`Release` store per publish batch from ingest, an `Acquire` load per request from every
-shard. That single atomic is the entire coupling between the write side and the read side.
-Everything the shards read is immutable, which is what licenses lock-free reads, epoch
-reclamation, and permanent precomputation.
-
-## The unresolved fork
-
-`research/CLAUDE_ROAST_1.md` disagrees with `research/DESIGN.md` on load-bearing points,
-and no winner has been picked. Reading both as though they agree is a good way to stay
-confused. The live disagreements:
-
-| Question | DESIGN.md | CLAUDE_ROAST_1.md |
-|---|---|---|
-| Runtime | Compio thread-per-core on io_uring | io_uring is seccomp-blocked by default in Docker 25+ and containerd; start on tokio/epoll |
-| What gets pre-rendered | Full HTTP response, headers included | Body only; baked headers break Range, 304, and HTTP/2 |
-| Metadata store | Custom frozen plus delta over a huge-page arena | An embedded KV store is adequate; harmonia serves narinfo at 82 microseconds from SQLite |
-| The real bottleneck | Server-side per-request fixed cost | Client-side xz decompression and narinfo round-trip concurrency |
-| Reclamation | `crossbeam-epoch` | `arc-swap`, given whole-snapshot swap |
-| DST | The centerpiece | Not achievable on compio today; schedule risk |
-
-DESIGN.md describes a v3 architecture. The roast describes a v1 that can be finished. The
-crate boundaries above survive either answer, so this fork is safe to leave open while
-writing `core`, and expensive to leave open past that.
+**The content-addressed name.** `core::narurl` owns it, `store` turns it into a path,
+`serve` routes on it, and the `PUT` target carries the hash the body must match. That last
+part is what lets verification happen during receive, before anything durable is named.
 
 ## Where to look
 
 - `research/NIX_PRIMER.md`: what NAR, narinfo, and the store path hash are. Start here if
   the protocol vocabulary is not yet automatic.
-- `research/DESIGN.md`: the reasoning, per decision, with the numbers.
-- `research/CLAUDE_ROAST_1.md`: the evidence-based challenge to it, plus a staged plan.
+- `research/DESIGN_V2.md`: the reasoning, per decision, with the numbers, plus what V1
+  actually shipped and where it departs from the design.
+- `research/DESIGN.md` and `research/CLAUDE_ROAST_1.md`: the argument DESIGN_V2 answers.
 - `research/ATTIC_BREAKDOWN.md`: how the closest prior art works and where it hurts.
 - `crates/*/README.md`: per-crate owns, does-not-own, and depends-on.

@@ -9,10 +9,11 @@ supersedes: research/DESIGN.md
 inputs:
   - research/DESIGN.md
   - research/CLAUDE_ROAST_1.md
+  - NixOS/nix @ 7362ff0 (2.36.0), read for client behaviour
 last_updated: 2026-07-30
 ---
 
-# bincache — Design v2
+# bincache: Design v2
 
 This document replaces `research/DESIGN.md`. It keeps the decisions from v1 that survived
 `research/CLAUDE_ROAST_1.md`, reverses the ones that did not, and records the reversals
@@ -65,14 +66,14 @@ That labeling is the honest version of v1's performance argument, not a retreat 
 | Reclamation | `crossbeam-epoch` | `arc-swap`, revisit only on measured guard cost |
 | Compression | ZSTD | ZSTD only, with Nix 2.4+ declared as a client floor |
 | Push protocol | HTTP `PUT` | `PUT` plus bearer tokens for v1; S3 API later |
-| HTTP version | Hand-rolled HTTP/1.1 | Unchanged for v1, keep-alive tuned; h2 deferred |
+| HTTP version | Hand-rolled HTTP/1.1 | Unchanged for v1, keep-alive tuned; h2 deferred but first in the queue |
 | TLS | kTLS offload | Userspace `rustls`; kTLS deferred until it proves out |
 | Accept model | `SO_REUSEPORT` per shard | Unchanged; connection skew accepted as a known issue |
 | Testing | DST as the centerpiece | Deferred. `loom` plus property tests; the seam is kept |
 | GC | Closure-aware eviction planner | No GC in v1. Mechanism only, operator-triggered delete |
 | Scale target | Unstated | Hard ceiling of ~10M paths for the RAM tier |
 | Baselines | Unstated | Skeleton first, harmonia/nginx comparison after |
-| Prerender scope | Full HTTP response, headers included | **Open.** See `Still Open` |
+| Prerender scope | Full HTTP response, headers included | Body only, framing built per request. See `What gets prerendered` |
 
 ## Protocol surface (the part v1 never wrote down)
 
@@ -87,8 +88,11 @@ everything, it goes first.
 - `GET /nar/<filehash>.nar.zst`, Content-Type `application/x-nix-nar`.
 
 **narinfo fields:** `StorePath`, `URL`, `Compression`, `FileHash`, `FileSize`, `NarHash`,
-`NarSize`, `References`, `Deriver`, `Sig`, `CA`. `NarHash` and `NarSize` are required by
-the client. `FileHash` and `FileSize` describe the *compressed* file, not the NAR.
+`NarSize`, `References`, `Deriver`, `Sig`, `CA`. `FileHash` and `FileSize` describe the
+*compressed* file, not the NAR. Exactly four are hard-required: `NarInfo::NarInfo` in
+`src/libstore/nar-info.cc` throws `corrupt` unless `StorePath`, `NarHash`, and `URL` are
+present and `NarSize` is nonzero. Everything else parses fine by its absence, which makes
+those four the conformance floor rather than the full field list.
 
 **Signing:** `Sig` is `<key-name>:<base64 ed25519 signature>` over the standard
 fingerprint string built from `StorePath`, `NarHash`, `NarSize`, and sorted `References`.
@@ -96,15 +100,43 @@ Multiple `Sig` lines are legal and a client accepts the path if *any* signature 
 key in its `trusted-public-keys`. That is what makes key rotation non-disruptive: publish
 the new public key to clients, then switch the signing key.
 
-**Two client behaviours that constrain the design:**
+### Client behaviours that constrain the design
 
-- Nix decides how to decompress from the narinfo `Compression` field, not from HTTP
-  `Content-Encoding`. Transparent HTTP compression is the wrong lever and also breaks
+Read out of the Nix 2.36.0 tree rather than recalled, because every one of these decides
+something below. `filetransfer.cc` and `http-binary-cache-store.cc` are the two files.
+
+- **Decompression is chosen from the narinfo `Compression` field, not from HTTP
+  `Content-Encoding`.** Transparent HTTP compression is the wrong lever and also breaks
   resumption.
-- Clients cache narinfo results in a local SQLite disk cache with a **positive TTL of 30
-  days** and a **negative TTL of 3600 s**. A warm client does not re-ask. This is why the
-  negative-lookup filter tier below is demoted: it only earns its keep during cold-cache
-  stampedes, not in steady state.
+- **An absent or empty `Compression` field means bzip2, not none.** `nar-info.cc` defaults
+  it that way and calls the conditional that produces it a mistake in its own comment.
+  Always emit `Compression: zstd` explicitly; omitting it does not mean what it looks like.
+- **Clients cache narinfo results in a local SQLite disk cache** with a **positive TTL of
+  30 days** and a **negative TTL of 3600 s**, both floors that `--refresh` cannot lower
+  (`nar-info-disk-cache.cc` clamps with `std::max`). A warm client does not re-ask. This is
+  why the negative-lookup filter tier below is demoted: it only earns its keep during
+  cold-cache stampedes, not in steady state.
+- **`HEAD` hits both endpoints, not just narinfo.** `isValidPathUncached` HEADs
+  `<hash>.narinfo`, and the upload path HEADs the NAR `URL` to skip re-uploading a payload
+  that already exists. Only the status code is read, since curl is in `NOBODY` mode.
+- **No conditional requests, ever.** `expectedETag` is set only by the tarball fetcher in
+  `libfetchers`. The binary cache store never sends `If-None-Match`, so `ETag` and 304 are
+  dead weight on both endpoints.
+- **`Range` is used only to resume a NAR mid-stream.** `CURLOPT_RESUME_FROM_LARGE` emits a
+  single open-ended `Range: bytes=N-`, and `maybeRetry` resumes only when the original
+  response carried `Accept-Ranges: bytes` *and* no `Content-Encoding`. Narinfo bodies are
+  buffered into a string rather than streamed to a sink, so `writtenToSink` stays zero and
+  that branch is unreachable for metadata.
+- **curl requests transparent compression on every download.** `CURLOPT_ACCEPT_ENCODING`
+  is set to `""`, meaning every encoding the linked libcurl supports. Answering a NAR with
+  `Content-Encoding` therefore double-encodes against the narinfo `Compression` contract
+  *and* silently disables resume.
+- **The client negotiates HTTP/2 by default over TLS.** The `http2` setting defaults true,
+  `CURLOPT_HTTP_VERSION` is `CURL_HTTP_VERSION_2TLS`, `CURLOPT_PIPEWAIT` is set, and the
+  multi handle enables `CURLPIPE_MULTIPLEX`. `http-connections` (default 25) caps TCP
+  connections, not in-flight requests, so over h2 one connection carries an entire closure
+  query. `2TLS` also means plaintext `http://` stays HTTP/1.1: there is no h2c upgrade to
+  support.
 
 **Explicitly not in v1:** `.ls` file listings, `log/<drv>` build logs, `debuginfo/`, and
 `realisations/<drvOutput>.doi` for content-addressed derivations. Harmonia implements
@@ -256,6 +288,46 @@ What the KV store buys, all of which v1 had to build by hand:
 `fjall` is the named alternative if write throughput ever dominates, since an LSM absorbs
 bursts better than a B-tree. That would be a measured swap behind the same `Index` trait.
 
+### What gets prerendered
+
+This was the last open decision in the document. **Resolved: the prerendered artifact is
+the narinfo body. Framing is built per request.** v1 baked whole HTTP responses, headers
+included; that is reversed.
+
+The argument is a straight cost/benefit once the client behaviours above are on the table.
+
+*What baking headers would buy.* A narinfo response's headers are a pure function of the
+body: a status line, `Content-Type: text/x-nix-narinfo`, and `Content-Length`. Nothing
+varies per request. Nothing else in the response is read on this endpoint, because the
+client sends no `If-None-Match` (so `ETag` and 304 are unreachable), sends no `Range` on
+metadata (so `Accept-Ranges` is unreachable), and buffers the body rather than streaming
+it. So concatenating the header prefix into the stored blob saves exactly **one iovec
+entry**. Under a vectored write that is the same one syscall either way. The measured win
+is zero, and it was never anything else; v1 simply never priced it.
+
+*What baking headers would cost.* HTTP/1.1 framing, permanently, in the durable
+representation. The client negotiates h2 by default over TLS and bincache terminates TLS
+in-process, so **every real client of this cache will be speaking h2**, where a baked
+`HTTP/1.1 200 OK\r\n...` prefix is not a prefix of anything. h2 is also the highest-value
+deferred item in this document, since multiplexing is what answers issue #5118 and it is
+purely a server-side change. Baking h1 framing would mean paying a data migration to
+collect the largest available win.
+
+Zero benefit against a self-inflicted block on the best remaining optimization is not a
+close call. The hybrid that was also on the table, storing the body alongside a cached
+HTTP/1.1 header prefix for the plain-GET fast path, is rejected for the same reason: it
+buys the same nothing and adds a second representation to keep coherent.
+
+So: `bincache-core` renders a body, `bincache-index` stores and publishes bodies, and
+`bincache-serve` owns framing entirely. `HEAD` reuses the body's length and writes no body.
+The protocol version stops being visible to the storage layer, which is what keeps h2 a
+serving-crate change rather than a schema change.
+
+The residue of v1's idea survives and is the part that mattered: the expensive work
+(rendering, signing) still happens once at ingest, and the read path still writes immutable
+bytes it did not allocate or format. Only the boundary of "what is a blob" moved, from the
+response to the body.
+
 ### RAM tier: a projection, added later, with a ceiling
 
 When profiling shows the KV read path is hot, a RAM tier lands **as a strictly derived
@@ -318,6 +390,16 @@ shard.
   storage, one NAR per path. If xz support is ever needed it arrives as a lazily
   transcoded second artifact, and that is a v2 problem with a real concurrency question
   attached.
+- **`Accept-Ranges: bytes` is mandatory here, and `Content-Encoding` is banned here.** Both
+  follow from `maybeRetry`: once a NAR download has streamed any bytes to the sink, the
+  client can only retry a transient failure by resuming, and it refuses to resume unless
+  the first response advertised byte ranges with no content encoding. Get either wrong and
+  a dropped connection 9 GB into a 10 GB NAR restarts at zero instead of resuming, which
+  presents as a mysterious throughput cliff and never as an error. The Range support
+  actually exercised is the single open-ended `bytes=N-` that `CURLOPT_RESUME_FROM_LARGE`
+  emits; `bytes=N-M` costs nothing extra to serve from the same code, and multi-range
+  requests get a plain 200 with the whole body, which RFC 9110 permits. A 206 carries
+  `Content-Range` and the partial `Content-Length`.
 - **TLS: userspace [[rustls]].** kTLS is deferred until there is proof it improves
   anything. The entire public demonstration of the io_uring + kTLS + Rust stack is one
   April 2025 hobbyist blog that required upstreaming two PRs to the `ktls` crate, ran no
@@ -472,8 +554,15 @@ them. Building that is original R&D, and it is not what this project is for.
 
 What ships instead:
 
-- **Property tests** ([[proptest]] / [[bolero]]) on the pure core: narinfo render/parse
+- **Property tests** ([[hegel]], per the repo rule) on the pure core: narinfo render/parse
   round-trips, base32 decode, signature verify.
+- **Protocol conformance tests, since conformance gates everything.** Each client
+  behaviour recorded above becomes an assertion: a NAR response advertises
+  `Accept-Ranges: bytes` and carries no `Content-Encoding`; a connection dropped mid-NAR
+  is resumed by `Range: bytes=N-` rather than restarted; `HEAD` answers on both endpoints;
+  a narinfo omitting any of `StorePath` / `NarHash` / `URL` / nonzero `NarSize` is caught
+  here rather than by a client's `corrupt` error. The end-to-end version is a real
+  `nix build` substituting a closure, which is the only thing that actually proves it.
 - **[[loom]]** on the lock-free pieces, which is the narrow slice that actually needs
   schedule exploration.
 - **Fault injection against the imperative shell**: torn uploads, disk-full mid-pipeline,
@@ -547,6 +636,8 @@ Stated as targets to measure, not as results:
 | Elephant-stream shard skew | Throughput | **Accepted, unmitigated.** eBPF reuseport selection or split accept queues are the named fixes when measured |
 | Userspace TLS touches every byte | Perf | Accepted for v1; kTLS spike gated on a measured win |
 | zstd-only locks out pre-2.4 clients | Compatibility | Declared client floor; lazy xz transcoding is the escape hatch |
+| Missing `Accept-Ranges` silently kills NAR resume | Throughput | Mandatory header on the payload plane, asserted by a conformance test that drops a connection mid-NAR and requires a resumed retry |
+| HTTP/1.1-only origin serializes closure queries | Latency | Known and accepted for the skeleton; h2 is the first optimization after it, and nothing durable encodes h1 framing |
 | Unbounded growth without GC | Availability | Manual delete only in v1; mechanism proven so policy can land later |
 | RAM projection exceeds ~10M paths | Scale | Hard ceiling stated; `redb` remains ground truth beyond it |
 | Shard head-of-line blocking | Tail latency | Chunked sends plus yields; heartbeat watchdog |
@@ -579,18 +670,15 @@ Stated as targets to measure, not as results:
 
 ## Still open
 
-- **Prerender scope, and it is genuinely open.** v1 baked entire HTTP responses including
-  headers. That breaks Range requests, conditional requests and 304s, HTTP/2 framing,
-  keep-alive versus close, and content negotiation. The candidates are (a) body only with
-  headers built per request, (b) body plus a cached HTTP/1.1 header prefix for the plain
-  GET fast path with a fallback for everything else, or (c) full response with Range and
-  304 explicitly declined on the narinfo endpoint. **Undecided pending research.** Note
-  that Range matters for NAR resumption, so whatever is decided for narinfo, NAR responses
-  must support it.
-- **HTTP/2.** Hand-rolled HTTP/1.1 with tuned keep-alive ships first. Nix opens up to
-  `http-connections` (default 25) parallel connections, so keep-alive captures much of the
-  concurrency win. h2 multiplexing directly targets issue #5118 and is the highest-value
-  deferred item in this document.
+- **HTTP/2, which is now the top of the queue rather than a vague someday.** Hand-rolled
+  HTTP/1.1 with tuned keep-alive still ships first, because it is the shortest path to a
+  conformant skeleton. But the client evidence sharpens the stakes: h2 is not something a
+  client has to opt into, it is what curl negotiates by default on every TLS connection,
+  and `http-connections` caps connections rather than in-flight requests. An HTTP/1.1-only
+  origin therefore forces a 500-path closure query into 25 connections' worth of
+  serialization, which is precisely the shape issue #5118 measures at 38 s versus 0.73 s.
+  This is the highest-value deferred item in the document, it is entirely server-side, and
+  the prerender decision above exists to keep it a serving-crate change.
 - **kTLS.** Spike it against a 100 MB NAR versus userspace rustls. Adopt only on a measured
   win.
 - **S3-compatible ingest.** Named as the next write surface, unscheduled.

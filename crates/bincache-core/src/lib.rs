@@ -9,5 +9,6 @@ pub mod cacheinfo;
 pub mod compression;
 pub mod hash;
 pub mod narinfo;
+pub mod narurl;
 pub mod sign;
 pub mod storepath;

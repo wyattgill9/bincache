@@ -15,9 +15,6 @@ pub const CONTENT_TYPE: &str = "text/x-nix-narinfo";
 /// Suffix of the metadata request key.
 pub const SUFFIX: &str = ".narinfo";
 
-/// Directory prefix of every NAR URL.
-pub const NAR_PREFIX: &str = "nar/";
-
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct NarInfo {
     pub store_path: crate::storepath::Path,
@@ -37,12 +34,12 @@ pub struct NarInfo {
 }
 
 impl NarInfo {
-    /// `nar/<file hash>.nar<ext>`, the URL nix builds in `BinaryCacheStore::addToStore`.
-    /// Derived rather than stored: the record already names both halves, and a second copy
-    /// would be a second thing to keep coherent.
+    /// Where the artifact this record describes lives. Derived rather than stored: the
+    /// record already names both halves, and a second copy would be a second thing to keep
+    /// coherent.
     #[must_use]
-    pub fn url(&self) -> String {
-        format!("{NAR_PREFIX}{}.nar{}", self.file_hash.base32(), self.compression.extension())
+    pub fn nar(&self) -> crate::narurl::NarUrl {
+        crate::narurl::NarUrl { file_hash: self.file_hash, compression: self.compression }
     }
 
     /// The canonical string ed25519 signs, per `ValidPathInfo::fingerprint`. References are
@@ -75,7 +72,7 @@ impl NarInfo {
     pub fn render(&self, dir: &crate::storepath::Dir) -> String {
         let mut body = String::with_capacity(1024);
         swrite::swriteln!(body, "StorePath: {}", dir.print(&self.store_path));
-        swrite::swriteln!(body, "URL: {}", self.url());
+        swrite::swriteln!(body, "URL: {}", self.nar().url());
         swrite::swriteln!(body, "Compression: {}", self.compression);
         swrite::swriteln!(body, "FileHash: {}", self.file_hash);
         swrite::swriteln!(body, "FileSize: {}", self.file_size);
@@ -184,6 +181,6 @@ mod tests {
     #[test]
     fn url_follows_the_file_hash_and_compression() {
         let info = sample();
-        assert_eq!(info.url(), format!("nar/{}.nar.zst", info.file_hash.base32()));
+        assert_eq!(info.nar().url(), format!("nar/{}.nar.zst", info.file_hash.base32()));
     }
 }

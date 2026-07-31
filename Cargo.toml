@@ -19,7 +19,10 @@ ed25519-dalek   = { version = "3.0", features = ["rand_core"] }
 expect-test     = { version = "1.5" }
 rand            = { version = "0.9" }
 redb            = { version = "4.1" }
-rkyv            = { version = "0.8" }
+# `unaligned` so an archive can be validated straight out of a `redb` value, which hands
+# back a byte slice at whatever alignment its page put it. `little_endian` so the on-disk
+# format does not change meaning on a big-endian or differently-tuned build.
+rkyv            = { version = "0.8", features = ["unaligned", "little_endian"] }
 sha2            = { version = "0.11" }
 snafu           = { version = "0.9" }
 socket2         = { version = "0.6" }

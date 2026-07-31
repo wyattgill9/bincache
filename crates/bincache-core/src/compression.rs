@@ -14,6 +14,7 @@
     strum::AsRefStr,
     strum::Display,
     strum::EnumString,
+    strum::VariantArray,
     rkyv::Archive,
     rkyv::Serialize,
     rkyv::Deserialize,
@@ -40,6 +41,17 @@ impl Compression {
             Self::Br => ".br",
         }
     }
+
+    /// Inverse of [`Compression::extension`], derived from it rather than restated: the
+    /// suffix is not the protocol name (`bzip2` writes `.bz2`), so an independent ladder
+    /// would be a second thing to keep in sync.
+    #[must_use]
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        strum::VariantArray::VARIANTS
+            .iter()
+            .copied()
+            .find(|candidate: &Self| candidate.extension() == extension)
+    }
 }
 
 #[cfg(test)]
@@ -65,5 +77,17 @@ mod tests {
     fn extensions_match_the_url_nix_builds() {
         assert_eq!(crate::compression::Compression::Zstd.extension(), ".zst");
         assert_eq!(crate::compression::Compression::None.extension(), "");
+        assert_eq!(crate::compression::Compression::Bzip2.extension(), ".bz2");
+    }
+
+    #[test]
+    fn every_extension_maps_back_to_its_algorithm() {
+        let variants: &[crate::compression::Compression] = strum::VariantArray::VARIANTS;
+        for compression in variants {
+            let recovered =
+                crate::compression::Compression::from_extension(compression.extension());
+            assert_eq!(recovered, Some(*compression));
+        }
+        assert_eq!(crate::compression::Compression::from_extension(".lzma"), None);
     }
 }

@@ -148,6 +148,8 @@ writing `core`, and expensive to leave open past that.
 
 ## Where to look
 
+- `research/NIX_PRIMER.md`: what NAR, narinfo, and the store path hash are. Start here if
+  the protocol vocabulary is not yet automatic.
 - `research/DESIGN.md`: the reasoning, per decision, with the numbers.
 - `research/CLAUDE_ROAST_1.md`: the evidence-based challenge to it, plus a staged plan.
 - `research/ATTIC_BREAKDOWN.md`: how the closest prior art works and where it hurts.

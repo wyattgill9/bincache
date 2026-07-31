@@ -18,7 +18,7 @@ Three routes, which is the whole protocol:
 | `GET`, `HEAD /<hash>.narinfo` | the signed manifest for one store path, or 404 |
 | `GET /nar/<file hash>.nar.zst` | the compressed NAR, resumable |
 
-Pushes arrive as `PUT` on the same shapes, authenticated with a bearer token. The server
+Pushes arrive as `PUT` on the same shapes, authenticated with a per-node token. The server
 verifies the NAR hash against the request target, compresses to zstd itself, and signs with
 a key that never leaves the box.
 
@@ -44,18 +44,23 @@ cargo build --release
 ### Pushing to it
 
 ```sh
-nix copy --to 'http://cache.example.org:5000?compression=none' /nix/store/...
+nix copy --to 'http://bincache:<the token>@cache.example.org:5000?compression=none' /nix/store/...
 ```
 
 `compression=none` is required. bincache verifies the NAR hash over the bytes the protocol
 defines and produces the zstd artifact itself, so it needs the uncompressed stream. A
 pre-compressed upload is refused with a message naming the setting.
 
-Nix reads the token from its netrc:
+The credential can go in the URI as above, in netrc, or in an `Authorization: Bearer`
+header. The username is ignored. Prefer netrc when the pushing user is trusted on that
+machine, since it keeps the token out of the process table:
 
 ```
 machine cache.example.org login bincache password <the token>
 ```
+
+Nix refuses a client-specified `netrc-file` for an untrusted user, which is why the URI form
+exists.
 
 ### Reading from it
 

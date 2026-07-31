@@ -692,6 +692,14 @@ than against a later claim, and a mismatch aborts before anything durable is nam
 narinfo `PUT` then supplies only what the server cannot compute: store path, references,
 deriver, `CA`. Every field describing the payload comes from what was received.
 
+**Push credentials arrive as HTTP Basic, not Bearer.** The document said bearer tokens, and
+that is what an explicit header carries, but it is not what a Nix client can actually send.
+`nix` refuses a client-specified `netrc-file` unless the pushing user is trusted on the
+machine, so the only configuration-free way to authenticate a push is credentials in the
+store URI, which curl sends as Basic. v1 accepts both schemes and reads the password out of
+a Basic credential, ignoring the username: a token already names the node that holds it.
+This was found by pushing with a real client, not by reading the source.
+
 **`HEAD` on an uncompressed NAR URL is answered from the NAR-hash index, not the
 filesystem.** `BinaryCacheStore::addToStore` probes the URL it is about to upload to, but
 bincache stores a recompressed artifact under a different name, so the file is not there
@@ -720,6 +728,24 @@ URL, and it is deliberate.
 - **`hegel` is not used.** The crate by that name on crates.io is an AWS Lambda payload
   library, not a property-testing framework. Property-shaped tests are written as
   deterministic loops over a seeded generator, so a failure is reproducible from the seed.
+- **The index stores records, not rendered bodies.** The document says both, in two places:
+  "values are `rkyv`-encoded records, not rendered bytes, so the render format can change
+  without a data migration" and, four paragraphs later, "`bincache-index` stores and
+  publishes bodies". Records win, because the first sentence's reason is the stronger one
+  and because re-signing the world under a new key has to be a pass over fields. Serving
+  renders per request; the RAM projection of rendered bodies is the deferred optimization
+  that makes the second sentence true.
+- **TLS is not implemented.** The document treats userspace `rustls` as the v1 answer and
+  defers only kTLS. v1 defers both. The consequence is that the h2-by-default client
+  behaviour the document leans on does not arise yet, since `CURL_HTTP_VERSION_2TLS` leaves
+  plaintext on HTTP/1.1. Terminating TLS in front is the interim answer and gives up the
+  payload plane's reason to exist, which is the tension the document already names.
+- **`loom` is not used.** It explores schedules over lock-free structures, and v1 has none:
+  the only shared mutable state on the serving path is per-shard relaxed counters, where
+  every interleaving is already permitted. It returns with the RAM projection, which is
+  where the first real reclamation question appears.
+- **`cargo-deny` is not wired up.** Named in the design and still owed, since a service
+  holding a signing key does not get to skip dependency auditing.
 - **Maintenance is a separate module from the serving-path writer.** A delete needs no
   signing key and no compression level; folding it into the ingest object forced every
   caller to invent values it never used.
@@ -740,6 +766,24 @@ URL, and it is deliberate.
   immediately reads the same as one that never did, so a beat count sits beside it.
 - **`Expect: 100-continue` is not optional.** curl sets it on uploads past about a kilobyte
   and stalls for a second per upload if nothing answers.
+- **A successful `PUT` must not close the connection.** The keep-alive decision keyed on
+  whether a request announced a body rather than on whether that body had been read, so
+  every successful push closed. A push is two requests per path and a closure is hundreds of
+  paths, which is a reconnect each.
+- **The negative-lookup cache is real and immediately in the way.** During end-to-end
+  testing, a client that had once seen a 404 for a path on a given cache URL would not ask
+  again, and pointing it at the same server on a different port was the only way to get a
+  query out of it. The document predicted this from `nar-info-disk-cache.cc`; it is worth
+  recording that it is not a subtle effect. It is also the reason the binary fuse filter
+  earns nothing in steady state.
+
+### Verified against a real client
+
+`nix copy --to 'http://user:token@host?compression=none'` pushes, `nix path-info --store
+http://host` reads the record back, and `nix copy --from http://host --to file://...` with
+`--option trusted-public-keys` set to bincache's key downloads the zstd artifact, verifies
+the signature, decompresses, checks `NarHash`, and writes the path into a destination store.
+That is the end-to-end proof the testing section asks for. Nix 2.34.8 was the client.
 
 ### Deferred, unchanged from the plan above
 

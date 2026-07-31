@@ -440,8 +440,8 @@ impl Cache {
     ) -> bincache_ingest::auth::Admission {
         let admission = request
             .authorization
-            .and_then(bincache_ingest::auth::bearer)
-            .map_or(bincache_ingest::auth::Admission::Denied, |token| self.tokens.admits(token));
+            .and_then(bincache_ingest::auth::credential)
+            .map_or(bincache_ingest::auth::Admission::Denied, |token| self.tokens.admits(&token));
         if admission == bincache_ingest::auth::Admission::Denied {
             crate::stats::Shard::bump(&self.stats.get(shard).rejections, 1);
         }

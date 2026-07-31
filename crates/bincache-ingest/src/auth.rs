@@ -68,12 +68,32 @@ pub fn generate() -> String {
     data_encoding::BASE64URL_NOPAD.encode(&entropy)
 }
 
-/// Pulls the credential out of an `Authorization` header value. Case-insensitive on the
-/// scheme, per RFC 9110.
+/// Pulls the credential out of an `Authorization` header value.
+///
+/// Both schemes a Nix client can produce are accepted. `Bearer` is what an explicit header
+/// carries. `Basic` is what curl sends for netrc entries and for credentials embedded in
+/// the store URI, which is the only way to authenticate a push without being a trusted user
+/// on the pushing machine: nix refuses a client-specified `netrc-file` otherwise.
+///
+/// For `Basic`, the password is the token and the username is ignored: a token already
+/// names the node that holds it, so a second name would be a second thing to keep in sync.
+///
+/// Scheme matching is case-insensitive, per RFC 9110.
 #[must_use]
-pub fn bearer(header: &str) -> Option<&str> {
-    let (scheme, credential) = header.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("Bearer") { Some(credential.trim()) } else { None }
+pub fn credential(header: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let (scheme, encoded) = header.split_once(' ')?;
+    let encoded = encoded.trim();
+
+    if scheme.eq_ignore_ascii_case("Bearer") {
+        return Some(std::borrow::Cow::Borrowed(encoded));
+    }
+    if scheme.eq_ignore_ascii_case("Basic") {
+        let decoded = data_encoding::BASE64.decode(encoded.as_bytes()).ok()?;
+        let pair = String::from_utf8(decoded).ok()?;
+        let (_user, password) = pair.split_once(':')?;
+        return Some(std::borrow::Cow::Owned(password.to_owned()));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -110,10 +130,45 @@ mod tests {
 
     #[test]
     fn reads_the_bearer_scheme_case_insensitively() {
-        assert_eq!(crate::auth::bearer("Bearer abc"), Some("abc"));
-        assert_eq!(crate::auth::bearer("bearer abc"), Some("abc"));
-        assert_eq!(crate::auth::bearer("BEARER abc"), Some("abc"));
-        assert_eq!(crate::auth::bearer("Basic abc"), None);
-        assert_eq!(crate::auth::bearer("abc"), None);
+        for header in ["Bearer abc", "bearer abc", "BEARER abc"] {
+            assert_eq!(crate::auth::credential(header).as_deref(), Some("abc"));
+        }
+        assert_eq!(crate::auth::credential("abc"), None);
+        assert_eq!(crate::auth::credential("Digest abc"), None);
+    }
+
+    /// What curl sends for a netrc entry or for `http://user:token@host`, which is how a
+    /// push authenticates when the pushing user is not trusted and nix refuses a
+    /// client-specified `netrc-file`.
+    #[test]
+    fn reads_the_password_out_of_a_basic_credential() {
+        let encoded = data_encoding::BASE64.encode(b"bincache:the-token");
+        let header = format!("Basic {encoded}");
+        assert_eq!(crate::auth::credential(&header).as_deref(), Some("the-token"));
+
+        // The username is ignored, so a client may use any.
+        let encoded = data_encoding::BASE64.encode(b"someone-else:the-token");
+        let header = format!("Basic {encoded}");
+        assert_eq!(crate::auth::credential(&header).as_deref(), Some("the-token"));
+
+        // A password containing a colon survives, since only the first is a separator.
+        let encoded = data_encoding::BASE64.encode(b"user:tok:en");
+        let header = format!("Basic {encoded}");
+        assert_eq!(crate::auth::credential(&header).as_deref(), Some("tok:en"));
+    }
+
+    #[test]
+    fn refuses_a_basic_credential_it_cannot_decode() {
+        assert_eq!(crate::auth::credential("Basic !!!not-base64!!!"), None);
+        let encoded = data_encoding::BASE64.encode(b"no-colon-here");
+        assert_eq!(crate::auth::credential(&format!("Basic {encoded}")), None);
+    }
+
+    #[test]
+    fn a_basic_credential_is_admitted_like_a_bearer_one() {
+        let tokens = crate::auth::Tokens::new(["the-token".to_owned()]);
+        let header = format!("Basic {}", data_encoding::BASE64.encode(b"bincache:the-token"));
+        let presented = crate::auth::credential(&header).expect("decodes");
+        assert_eq!(tokens.admits(&presented), crate::auth::Admission::Admitted);
     }
 }

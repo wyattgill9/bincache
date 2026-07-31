@@ -8,12 +8,39 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-clap  = { version = "4.6", features = ["derive"] }
-snafu = { version = "0.9" }
+bytes           = { version = "1.12" }
+clap            = { version = "4.6", features = ["derive", "env"] }
+compio          = { version = "0.19", features = ["macros", "runtime"] }
+core_affinity   = { version = "0.8" }
+crossbeam-utils = { version = "0.8" }
+data-encoding   = { version = "2.9" }
+derive_more     = { version = "2.1", features = ["as_ref", "display", "from"] }
+ed25519-dalek   = { version = "3.0", features = ["rand_core"] }
+expect-test     = { version = "1.5" }
+rand            = { version = "0.9" }
+redb            = { version = "4.1" }
+rkyv            = { version = "0.8" }
+sha2            = { version = "0.11" }
+snafu           = { version = "0.9" }
+socket2         = { version = "0.6" }
+strum           = { version = "0.28", features = ["derive"] }
+subtle          = { version = "2.6" }
+swrite          = { version = "0.1" }
+tracing         = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd            = { version = "0.13" }
+
+pretty_assertions = { version = "1.4" }
+
+bincache-core   = { path = "crates/bincache-core" }
+bincache-index  = { path = "crates/bincache-index" }
+bincache-ingest = { path = "crates/bincache-ingest" }
+bincache-serve  = { path = "crates/bincache-serve" }
+bincache-store  = { path = "crates/bincache-store" }
 
 [workspace.lints.rust]
 # deny (not forbid) so the buffer-pool and index crates can carve out
-# `#![allow(unsafe_code)]` at the module that needs it (DESIGN.md).
+# `#![allow(unsafe_code)]` at the module that needs it (DESIGN_V2.md).
 unsafe_code = "deny"
 
 [workspace.lints.clippy]
@@ -21,3 +48,8 @@ unsafe_code = "deny"
 cast_possible_truncation = "deny"
 cast_precision_loss = "deny"
 cast_sign_loss = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

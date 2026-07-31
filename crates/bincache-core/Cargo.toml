@@ -4,5 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[dependencies]
+data-encoding = { workspace = true }
+derive_more   = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand          = { workspace = true }
+rkyv          = { workspace = true }
+sha2          = { workspace = true }
+snafu         = { workspace = true }
+strum         = { workspace = true }
+subtle        = { workspace = true }
+swrite        = { workspace = true }
+
+[dev-dependencies]
+expect-test       = { workspace = true }
+pretty_assertions = { workspace = true }
+
 [lints]
 workspace = true

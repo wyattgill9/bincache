@@ -20,10 +20,9 @@ const INTERVAL: core::time::Duration = core::time::Duration::from_secs(5);
 /// Detached on purpose: bincache is crash-only, so there is no orderly shutdown for this
 /// thread to participate in.
 pub fn spawn(stats: bincache_serve::stats::Shards, stale: core::time::Duration) {
-    let started = std::time::Instant::now();
     let spawned = std::thread::Builder::new()
         .name("bincache-watchdog".to_owned())
-        .spawn(move || watch(&stats, started, stale));
+        .spawn(move || watch(&stats, stale));
 
     if let Err(error) = spawned {
         // Serving without a watchdog is degraded, not broken: it costs visibility into a
@@ -32,14 +31,10 @@ pub fn spawn(stats: bincache_serve::stats::Shards, stale: core::time::Duration) 
     }
 }
 
-fn watch(
-    stats: &bincache_serve::stats::Shards,
-    started: std::time::Instant,
-    stale: core::time::Duration,
-) {
+fn watch(stats: &bincache_serve::stats::Shards, stale: core::time::Duration) {
     loop {
         std::thread::sleep(INTERVAL);
-        let stalled = stats.stalled(started.elapsed(), stale);
+        let stalled = stats.stalled(stale);
         if !stalled.is_empty() {
             tracing::error!(
                 shards = ?stalled,

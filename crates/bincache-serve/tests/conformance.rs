@@ -1,0 +1,592 @@
+//! Protocol conformance, asserted against a real server over a real socket.
+//!
+//! Every check here corresponds to a client behaviour recorded in `research/DESIGN_V2.md`
+//! under "Client behaviours that constrain the design". Conformance gates every
+//! optimization, so these run in `cargo nextest run` rather than in a script an operator
+//! has to remember.
+//!
+//! The wire is spoken directly rather than through a client library, because the point is
+//! the exact bytes.
+
+use compio::io::AsyncRead as _;
+use compio::io::AsyncWriteExt as _;
+
+/// A minimal but genuine `nix-archive-1` serialization of one regular file, so the NAR
+/// hash under test is a hash of something a client could actually have produced.
+fn nar(contents: &[u8]) -> Vec<u8> {
+    fn padded(value: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&u64::try_from(value.len()).expect("fits").to_le_bytes());
+        out.extend_from_slice(value);
+        out.resize(out.len() + (8 - value.len() % 8) % 8, 0);
+    }
+
+    let mut out = Vec::new();
+    for token in [b"nix-archive-1".as_slice(), b"(", b"type", b"regular", b"contents"] {
+        padded(token, &mut out);
+    }
+    padded(contents, &mut out);
+    padded(b")", &mut out);
+    out
+}
+
+struct Response {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Response {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+struct Server {
+    address: std::net::SocketAddr,
+    token: String,
+    key: bincache_core::sign::PublicKey,
+    dir: bincache_core::storepath::Dir,
+}
+
+impl Server {
+    async fn start(name: &str) -> Self {
+        let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"))
+            .join("test-artifacts")
+            .join("bincache-serve")
+            .join(name);
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "stale root not removable");
+        }
+
+        let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
+        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
+        let secret = bincache_core::sign::SecretKey::generate("bincache-test-1".to_owned());
+        let dir =
+            bincache_core::storepath::Dir::new(bincache_core::storepath::DIR_DEFAULT.to_owned())
+                .expect("absolute");
+
+        let ingest = bincache_ingest::ingest::Ingest::new(bincache_ingest::ingest::Parts {
+            store,
+            index,
+            key: secret.clone(),
+            dir: dir.clone(),
+            level: bincache_ingest::upload::Level::new(3).expect("in range"),
+        });
+
+        let token = bincache_ingest::auth::generate();
+        let cache = bincache_serve::handler::Cache::new(bincache_serve::handler::Parts {
+            ingest,
+            tokens: bincache_ingest::auth::Tokens::new([token.clone()]),
+            info: bincache_core::cacheinfo::CacheInfo {
+                store_dir: dir.clone(),
+                mass_query: bincache_core::cacheinfo::MassQuery::Wanted,
+                priority: bincache_core::cacheinfo::Priority(30),
+            },
+            stats: bincache_serve::stats::Shards::new(
+                core::num::NonZeroUsize::new(1).expect("nonzero"),
+            ),
+        });
+
+        // Port zero: the kernel picks, so parallel test binaries never collide.
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let address = listener.local_addr().expect("has an address");
+        compio::runtime::spawn(bincache_serve::shard::accept(0, listener, cache)).detach();
+
+        Self { address, token, key: secret.public(), dir }
+    }
+
+    async fn connect(&self) -> compio::net::TcpStream {
+        compio::net::TcpStream::connect(self.address).await.expect("connects")
+    }
+
+    /// One request on its own connection.
+    async fn request(&self, head: &str, body: &[u8]) -> Response {
+        let mut stream = self.connect().await;
+        exchange(&mut stream, head, body).await
+    }
+
+    fn authorized(&self, method: &str, target: &str, len: usize) -> String {
+        format!(
+            "{method} {target} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+             Content-Length: {len}\r\n\r\n",
+            self.token
+        )
+    }
+}
+
+async fn exchange(stream: &mut compio::net::TcpStream, head: &str, body: &[u8]) -> Response {
+    let mut request = head.as_bytes().to_vec();
+    request.extend_from_slice(body);
+    let compio::BufResult(written, _) = stream.write_all(request).await;
+    written.expect("writes the request");
+    read_response(stream, Body::from(head)).await
+}
+
+/// Whether a response is followed by body bytes on the wire.
+///
+/// `Content-Length` on a `HEAD` response describes the body a `GET` would return, and a
+/// `100 Continue` has no length at all. Reading either as a body waits forever, so the
+/// reader is told which to expect rather than guessing from the headers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Body {
+    Expected,
+    None,
+}
+
+impl Body {
+    fn from(head: &str) -> Self {
+        if head.starts_with("HEAD ") { Self::None } else { Self::Expected }
+    }
+}
+
+/// Reads exactly one response, using `Content-Length` for the body, which is the only
+/// framing this server ever emits.
+async fn read_response(stream: &mut compio::net::TcpStream, body: Body) -> Response {
+    let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let head_end = loop {
+        if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+        let len = buffer.len();
+        buffer.reserve(64 * 1024);
+        let compio::BufResult(read, slice) =
+            stream.read(compio::buf::IoBuf::slice(buffer, len..)).await;
+        buffer = compio::buf::IntoInner::into_inner(slice);
+        assert!(read.expect("reads") > 0, "peer closed before a complete response head");
+    };
+
+    let text = String::from_utf8(buffer[..head_end].to_vec()).expect("head is utf8");
+    let mut lines = text.split_terminator("\r\n");
+    let status: u16 = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    let headers: Vec<(String, String)> = lines
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(": "))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+
+    // An interim 1xx carries no length and no body; it is a marker, not a message.
+    let length: usize = if body == Body::None || (100..200).contains(&status) {
+        0
+    } else {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.parse().ok())
+            .expect("a Content-Length")
+    };
+
+    let mut body = buffer[head_end..].to_vec();
+    while body.len() < length {
+        let len = body.len();
+        body.reserve(length - len);
+        let compio::BufResult(read, slice) =
+            stream.read(compio::buf::IoBuf::slice(body, len..)).await;
+        body = compio::buf::IntoInner::into_inner(slice);
+        assert!(read.expect("reads") > 0, "peer closed before the body finished");
+    }
+    body.truncate(length);
+    Response { status, headers, body }
+}
+
+fn fields(body: &[u8]) -> std::collections::HashMap<String, Vec<String>> {
+    let mut parsed: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(body).lines() {
+        let (key, value) = match line.split_once(": ") {
+            Some(split) => split,
+            None => (line.trim_end_matches(':'), ""),
+        };
+        parsed.entry(key.to_owned()).or_default().push(value.to_owned());
+    }
+    parsed
+}
+
+/// Uploads a NAR and publishes a narinfo for it, exactly as `nix copy --to
+/// 'http://host?compression=none'` does: the payload first, then the metadata.
+struct Published {
+    path: String,
+    key: String,
+    nar: Vec<u8>,
+    nar_hash32: String,
+    narinfo: String,
+}
+
+async fn publish(server: &Server, seed: &[u8]) -> Published {
+    let body = nar(seed);
+    let nar_hash = bincache_core::hash::Sha256::digest(&body);
+    let nar_hash32 = nar_hash.base32();
+
+    let digest = bincache_core::hash::Sha256::digest(seed);
+    let mut raw = [0u8; bincache_core::storepath::HASH_WIDTH];
+    raw.copy_from_slice(&digest.as_bytes()[..bincache_core::storepath::HASH_WIDTH]);
+    let key = bincache_core::storepath::Hash::from_bytes(raw).to_string();
+    let path = format!("/nix/store/{key}-conformance-1.0");
+
+    let head = server.authorized("PUT", &format!("/nar/{nar_hash32}.nar"), body.len());
+    assert_eq!(server.request(&head, &body).await.status, 201, "the NAR upload is accepted");
+
+    let narinfo = format!(
+        "StorePath: {path}\nURL: nar/{nar_hash32}.nar\nCompression: none\n\
+         FileHash: sha256:{nar_hash32}\nFileSize: {}\nNarHash: sha256:{nar_hash32}\n\
+         NarSize: {}\nReferences: \n",
+        body.len(),
+        body.len()
+    );
+    let head = server.authorized("PUT", &format!("/{key}.narinfo"), narinfo.len());
+    assert_eq!(
+        server.request(&head, narinfo.as_bytes()).await.status,
+        201,
+        "the narinfo publish is accepted"
+    );
+
+    Published { path, key, nar: body, nar_hash32, narinfo }
+}
+
+#[compio::test]
+async fn nix_cache_info_carries_the_three_fields_a_client_reads() {
+    let server = Server::start("cache-info").await;
+    let response = server.request("GET /nix-cache-info HTTP/1.1\r\nHost: t\r\n\r\n", b"").await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("Content-Type"), Some("text/x-nix-cache-info"));
+    expect_test::expect![[r#"
+        StoreDir: /nix/store
+        WantMassQuery: 1
+        Priority: 30
+    "#]]
+    .assert_eq(&String::from_utf8(response.body).expect("utf8"));
+}
+
+/// The conformance floor from `research/DESIGN_V2.md`: `StorePath`, `NarHash`, `URL`, and a
+/// nonzero `NarSize`. Below that, `NarInfo::NarInfo` throws `corrupt` on the client.
+#[compio::test]
+async fn a_published_narinfo_verifies_the_way_a_client_verifies_it() {
+    let server = Server::start("narinfo").await;
+    let published = publish(&server, b"conformance payload").await;
+
+    let response = server
+        .request(&format!("GET /{}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", published.key), b"")
+        .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("Content-Type"), Some("text/x-nix-narinfo"));
+    assert_eq!(response.header("Content-Encoding"), None, "narinfo must not be encoded");
+
+    let parsed = fields(&response.body);
+    for required in ["StorePath", "URL", "NarHash", "NarSize"] {
+        assert!(parsed.contains_key(required), "{required} is missing from {parsed:?}");
+    }
+    assert_eq!(parsed["StorePath"][0], published.path);
+    assert_eq!(parsed["NarHash"][0], format!("sha256:{}", published.nar_hash32));
+    assert_ne!(parsed["NarSize"][0], "0");
+    assert_eq!(parsed["Compression"][0], "zstd", "the server recompressed on receipt");
+
+    // The decision a real client makes: accept the path if any Sig verifies against a key
+    // in trusted-public-keys, over the canonical fingerprint.
+    let record = bincache_core::narinfo::parse::parse(
+        &String::from_utf8(response.body).expect("utf8"),
+        &server.dir,
+    )
+    .expect("the served body parses as a narinfo");
+    assert_eq!(record.sigs.len(), 1, "managed signing replaces client signatures");
+    server
+        .key
+        .verify(&record.fingerprint(&server.dir), &record.sigs[0])
+        .expect("the signature verifies under the advertised public key");
+}
+
+#[compio::test]
+async fn head_reuses_the_body_length_and_writes_no_body() {
+    let server = Server::start("head").await;
+    let published = publish(&server, b"head payload").await;
+
+    let target = format!("/{}.narinfo", published.key);
+    let get = server.request(&format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+    let head = server.request(&format!("HEAD {target} HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+
+    assert_eq!(head.status, 200);
+    assert_eq!(head.header("Content-Length"), Some(get.body.len().to_string().as_str()));
+    assert!(head.body.is_empty());
+}
+
+/// `maybeRetry` in `nix/src/libstore/filetransfer.cc` resumes a dropped NAR only when the
+/// original response advertised `Accept-Ranges: bytes` *and* carried no `Content-Encoding`.
+/// Getting either wrong makes a dropped 10 GB transfer restart at zero, which presents as a
+/// throughput cliff and never as an error.
+#[compio::test]
+async fn a_nar_response_is_resumable() {
+    let server = Server::start("resumable").await;
+    let published = publish(&server, &b"payload for resume".repeat(2048)).await;
+
+    let record =
+        bincache_core::narinfo::parse::parse(&published.narinfo, &server.dir).expect("parses");
+    let served = server
+        .request(&format!("GET /{}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", published.key), b"")
+        .await;
+    let url = fields(&served.body)["URL"][0].clone();
+    assert_ne!(url, record.nar().url(), "the stored artifact is the recompressed one");
+
+    let whole = server.request(&format!("GET /{url} HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+    assert_eq!(whole.status, 200);
+    assert_eq!(whole.header("Content-Type"), Some("application/x-nix-nar"));
+    assert_eq!(whole.header("Accept-Ranges"), Some("bytes"), "resume needs this header");
+    assert_eq!(whole.header("Content-Encoding"), None, "resume is disabled by this header");
+    assert_eq!(whole.header("Content-Length"), Some(whole.body.len().to_string().as_str()));
+
+    // The single open-ended form `CURLOPT_RESUME_FROM_LARGE` emits, and the only one a Nix
+    // client ever sends.
+    let at = whole.body.len() / 2;
+    let resumed = server
+        .request(&format!("GET /{url} HTTP/1.1\r\nHost: t\r\nRange: bytes={at}-\r\n\r\n"), b"")
+        .await;
+    assert_eq!(resumed.status, 206);
+    assert_eq!(
+        resumed.header("Content-Range"),
+        Some(format!("bytes {at}-{}/{}", whole.body.len() - 1, whole.body.len()).as_str())
+    );
+    assert_eq!(resumed.body, whole.body[at..], "the resumed body is the tail, not a restart");
+    assert_eq!(resumed.header("Accept-Ranges"), Some("bytes"));
+
+    let past = server
+        .request(
+            &format!(
+                "GET /{url} HTTP/1.1\r\nHost: t\r\nRange: bytes={}-\r\n\r\n",
+                whole.body.len()
+            ),
+            b"",
+        )
+        .await;
+    assert_eq!(past.status, 416);
+    assert_eq!(
+        past.header("Content-Range"),
+        Some(format!("bytes */{}", whole.body.len()).as_str())
+    );
+}
+
+#[compio::test]
+async fn the_served_artifact_is_what_the_client_uploaded() {
+    let server = Server::start("artifact").await;
+    let published = publish(&server, &b"round trip payload".repeat(1024)).await;
+
+    let served = server
+        .request(&format!("GET /{}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", published.key), b"")
+        .await;
+    let parsed = fields(&served.body);
+    let url = parsed["URL"][0].clone();
+
+    let artifact = server.request(&format!("GET /{url} HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+    assert_eq!(parsed["FileSize"][0], artifact.body.len().to_string());
+    assert_eq!(
+        parsed["FileHash"][0],
+        bincache_core::hash::Sha256::digest(&artifact.body).to_string(),
+        "FileHash names the bytes actually served"
+    );
+
+    let decompressed = zstd::stream::decode_all(artifact.body.as_slice()).expect("decompresses");
+    assert_eq!(decompressed, published.nar);
+    assert_eq!(
+        bincache_core::hash::Sha256::digest(&decompressed).base32(),
+        published.nar_hash32,
+        "the decompressed bytes hash to the published NarHash"
+    );
+}
+
+/// `BinaryCacheStore::addToStore` HEADs the NAR URL before uploading. bincache stores a
+/// recompressed artifact under a different name, so this is answered from the NAR-hash
+/// index; a 404 would make every build node re-upload every NAR forever.
+#[compio::test]
+async fn head_on_an_uploaded_nar_url_reports_it_present() {
+    let server = Server::start("nar-probe").await;
+    let published = publish(&server, b"probe payload").await;
+
+    let present = server
+        .request(
+            &format!("HEAD /nar/{}.nar HTTP/1.1\r\nHost: t\r\n\r\n", published.nar_hash32),
+            b"",
+        )
+        .await;
+    assert_eq!(present.status, 200);
+
+    let absent = bincache_core::hash::Sha256::digest(b"never uploaded").base32();
+    let missing =
+        server.request(&format!("HEAD /nar/{absent}.nar HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+    assert_eq!(missing.status, 404);
+}
+
+#[compio::test]
+async fn a_malformed_key_dies_at_the_socket() {
+    let server = Server::start("malformed").await;
+    for target in
+        ["/abc.narinfo", "/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.narinfo", "/nar/notahash.nar.zst"]
+    {
+        let response =
+            server.request(&format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+        assert_eq!(response.status, 400, "{target} should have been refused");
+    }
+
+    // Routes this cache does not serve are absent, not malformed.
+    for target in ["/log/whatever.drv", "/5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j.ls"] {
+        let response =
+            server.request(&format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n"), b"").await;
+        assert_eq!(response.status, 404, "{target} should have been a miss");
+    }
+}
+
+#[compio::test]
+async fn a_miss_is_a_404_on_both_methods() {
+    let server = Server::start("miss").await;
+    let key = bincache_core::hash::Sha256::digest(b"absent").base32();
+    let key = &key[..bincache_core::storepath::HASH_TEXT_LEN];
+    for method in ["GET", "HEAD"] {
+        let response = server
+            .request(&format!("{method} /{key}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n"), b"")
+            .await;
+        assert_eq!(response.status, 404);
+    }
+}
+
+#[compio::test]
+async fn the_write_path_refuses_what_it_cannot_verify() {
+    let server = Server::start("write-refusals").await;
+    let body = nar(b"verified payload");
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+
+    let unauthenticated = format!(
+        "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    assert_eq!(server.request(&unauthenticated, &body).await.status, 401);
+
+    let wrong = format!(
+        "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer nope\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    assert_eq!(server.request(&wrong, &body).await.status, 401);
+
+    // The target states what the body must hash to, so a mismatch is caught before
+    // anything durable is named after it.
+    let lying = server.authorized("PUT", &format!("/nar/{hash32}.nar"), 5);
+    assert_eq!(server.request(&lying, b"wrong").await.status, 400);
+    let probe = format!("HEAD /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(server.request(&probe, b"").await.status, 404, "nothing durable was left");
+
+    // bincache compresses on receipt, so a pre-compressed upload is refused rather than
+    // stored under a hash of bytes it cannot verify.
+    let precompressed = server.authorized("PUT", &format!("/nar/{hash32}.nar.xz"), 2);
+    assert_eq!(server.request(&precompressed, b"xz").await.status, 400);
+
+    // A narinfo whose NAR was never uploaded has nothing to describe.
+    let orphan = "StorePath: /nix/store/5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j-orphan-1.0\n\
+                  URL: nar/x.nar\nCompression: none\n\
+                  FileHash: sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n\
+                  FileSize: 1\n\
+                  NarHash: sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n\
+                  NarSize: 1\nReferences: \n";
+    let head = server.authorized("PUT", "/5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j.narinfo", orphan.len());
+    assert_eq!(server.request(&head, orphan.as_bytes()).await.status, 400);
+}
+
+/// Content addressing plus an idempotent publish is what makes a client retry harmless,
+/// which matters because Nix's own HTTP store has no locking.
+#[compio::test]
+async fn pushing_the_same_path_twice_changes_nothing() {
+    let server = Server::start("idempotent").await;
+    let first = publish(&server, b"idempotent payload").await;
+    let target = format!("GET /{}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", first.key);
+    let before = server.request(&target, b"").await.body;
+
+    let second = publish(&server, b"idempotent payload").await;
+    assert_eq!(second.key, first.key);
+    assert_eq!(server.request(&target, b"").await.body, before);
+}
+
+/// A closure query fires hundreds of lookups at once, and `http-connections` caps
+/// connections rather than in-flight requests, so keep-alive is the difference between one
+/// handshake and hundreds.
+#[compio::test]
+async fn one_connection_serves_many_requests() {
+    let server = Server::start("keep-alive").await;
+    let published = publish(&server, b"keep-alive payload").await;
+
+    let mut stream = server.connect().await;
+    let hit = format!("GET /{}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", published.key);
+    let miss = "GET /5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j.narinfo HTTP/1.1\r\nHost: t\r\n\r\n";
+
+    for _ in 0..4 {
+        assert_eq!(exchange(&mut stream, &hit, b"").await.status, 200);
+        assert_eq!(exchange(&mut stream, miss, b"").await.status, 404);
+    }
+}
+
+#[compio::test]
+async fn a_connection_close_request_is_honoured() {
+    let server = Server::start("close").await;
+    let response = server
+        .request("GET /nix-cache-info HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", b"")
+        .await;
+    assert_eq!(response.header("Connection"), Some("close"));
+}
+
+#[compio::test]
+async fn chunked_uploads_are_refused_rather_than_misparsed() {
+    let server = Server::start("chunked").await;
+    let head = format!(
+        "PUT /nar/{}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+         Transfer-Encoding: chunked\r\n\r\n",
+        bincache_core::hash::Sha256::digest(b"x").base32(),
+        server.token
+    );
+    assert_eq!(server.request(&head, b"").await.status, 501);
+}
+
+/// curl sets `Expect: 100-continue` on uploads past about a kilobyte and stalls for a
+/// second if nothing answers.
+#[compio::test]
+async fn an_expect_continue_upload_is_answered_before_the_body() {
+    let server = Server::start("expect").await;
+    let body = nar(&b"expecting payload".repeat(256));
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+
+    let mut stream = server.connect().await;
+    let head = format!(
+        "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+         Expect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+        server.token,
+        body.len()
+    );
+    let compio::BufResult(written, _) = stream.write_all(head.into_bytes()).await;
+    written.expect("writes the head");
+
+    let interim = read_response(&mut stream, Body::Expected).await;
+    assert_eq!(interim.status, 100, "the server invites the body before it is sent");
+
+    let compio::BufResult(written, _) = stream.write_all(body).await;
+    written.expect("writes the body");
+    assert_eq!(read_response(&mut stream, Body::Expected).await.status, 201);
+}
+
+#[compio::test]
+async fn metrics_report_what_the_shard_counted() {
+    let server = Server::start("metrics").await;
+    let published = publish(&server, b"metrics payload").await;
+    server
+        .request(&format!("GET /{}.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", published.key), b"")
+        .await;
+    server
+        .request("GET /5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j.narinfo HTTP/1.1\r\nHost: t\r\n\r\n", b"")
+        .await;
+
+    let response = server.request("GET /metrics HTTP/1.1\r\nHost: t\r\n\r\n", b"").await;
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).expect("utf8");
+    assert!(body.contains("bincache_metadata_hits_total 1"), "{body}");
+    assert!(body.contains("bincache_metadata_misses_total 1"), "{body}");
+    assert!(body.contains("bincache_uploads_total 1"), "{body}");
+    assert!(body.contains("bincache_paths 1"), "{body}");
+}

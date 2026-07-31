@@ -79,9 +79,18 @@ impl NarInfo {
         swrite::swriteln!(body, "NarHash: {}", self.nar_hash);
         swrite::swriteln!(body, "NarSize: {}", self.nar_size);
 
-        body.push_str("References:");
-        for reference in &self.references {
-            swrite::swrite!(body, " {reference}");
+        // The trailing space is load-bearing and must survive an empty reference set.
+        // `NarInfo::to_string` writes the literal `"References: "` before joining, and
+        // `NarInfo::NarInfo` reads every value from two characters past the colon. A bare
+        // `References:` line therefore has no value for the client to read at all, which
+        // is a parse failure rather than an empty list.
+        body.push_str("References: ");
+        let mut references = self.references.iter();
+        if let Some(first) = references.next() {
+            swrite::swrite!(body, "{first}");
+            for reference in references {
+                swrite::swrite!(body, " {reference}");
+            }
         }
         body.push('\n');
 
@@ -148,11 +157,16 @@ mod tests {
         .assert_eq(&sample().render(&dir()));
     }
 
+    /// An empty reference set still has to produce a value nix can read. `NarInfo::NarInfo`
+    /// takes every value from `colon + 2`, so a line ending at the colon has nothing there.
     #[test]
-    fn emits_an_empty_references_line() {
+    fn an_empty_reference_set_still_renders_a_readable_value() {
         let mut info = sample();
         info.references.clear();
-        assert!(info.render(&dir()).contains("\nReferences:\n"));
+        let body = info.render(&dir());
+        assert!(body.contains("\nReferences: \n"), "{body}");
+        let parsed = crate::narinfo::parse::parse(&body, &dir()).expect("parses");
+        assert!(parsed.references.is_empty());
     }
 
     #[test]

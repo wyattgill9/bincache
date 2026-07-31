@@ -64,7 +64,6 @@ pub struct Config {
 pub fn run(config: Config, cache: crate::handler::Cache) -> Result<(), Error> {
     let Config { address, shards, pinning } = config;
     let cores = core_affinity::get_core_ids().unwrap_or_default();
-    let started = std::time::Instant::now();
 
     let mut threads = Vec::with_capacity(shards.get());
     for shard in 0..shards.get() {
@@ -82,7 +81,7 @@ pub fn run(config: Config, cache: crate::handler::Cache) -> Result<(), Error> {
                 {
                     core_affinity::set_for_current(core);
                 }
-                serve(shard, listener, cache, started)
+                serve(shard, listener, cache)
             })
             .context(RuntimeSnafu)?;
         threads.push(thread);
@@ -112,42 +111,55 @@ fn serve(
     shard: usize,
     listener: std::net::TcpListener,
     cache: crate::handler::Cache,
-    started: std::time::Instant,
 ) -> Result<(), Error> {
     let runtime = compio::runtime::Runtime::new().context(RuntimeSnafu)?;
     runtime.block_on(async move {
         let listener = compio::net::TcpListener::from_std(listener).context(AdoptSnafu)?;
-        tracing::info!(shard, "listening");
+        accept(shard, listener, cache).await;
+        Ok(())
+    })
+}
 
-        let beating = cache.clone();
+/// Accepts forever on the current runtime.
+///
+/// Public so a test can run a real server, over a real socket, in-process: the difference
+/// between asserting on this code and asserting on a copy of it is the whole value of a
+/// conformance test.
+pub async fn accept(
+    shard: usize,
+    listener: compio::net::TcpListener,
+    cache: crate::handler::Cache,
+) {
+    tracing::info!(shard, "listening");
+
+    let beating = cache.clone();
+    compio::runtime::spawn(async move {
+        loop {
+            compio::time::sleep(HEARTBEAT).await;
+            beating.stats().beat(shard);
+        }
+    })
+    .detach();
+
+    loop {
+        let accepted = listener.accept().await;
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // A failed accept is a per-connection fault, not a shard fault: a peer that
+                // vanished between SYN and accept must not take the shard down.
+                tracing::warn!(shard, error = ?error, "accept failed");
+                continue;
+            }
+        };
+        let cache = cache.clone();
         compio::runtime::spawn(async move {
-            loop {
-                compio::time::sleep(HEARTBEAT).await;
-                beating.stats().get(shard).beat(started.elapsed());
+            if let Err(error) = session(&cache, shard, stream).await {
+                tracing::debug!(shard, %peer, error = ?error, "connection ended");
             }
         })
         .detach();
-
-        loop {
-            let accepted = listener.accept().await;
-            let (stream, peer) = match accepted {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    // A failed accept is a per-connection fault, not a shard fault: a peer
-                    // that vanished between SYN and accept must not take the shard down.
-                    tracing::warn!(shard, error = ?error, "accept failed");
-                    continue;
-                }
-            };
-            let cache = cache.clone();
-            compio::runtime::spawn(async move {
-                if let Err(error) = session(&cache, shard, stream).await {
-                    tracing::debug!(shard, %peer, error = ?error, "connection ended");
-                }
-            })
-            .detach();
-        }
-    })
+    }
 }
 
 /// One connection, for as long as it stays alive.

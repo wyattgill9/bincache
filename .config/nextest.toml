@@ -1,0 +1,4 @@
+[profile.default]
+# A serving test that has not answered in eight seconds is wedged, not slow.
+slow-timeout = { period = "8s", terminate-after = 1 }
+fail-fast = false

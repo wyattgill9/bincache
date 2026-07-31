@@ -80,7 +80,13 @@ struct Draft {
 pub fn parse(body: &str, dir: &crate::storepath::Dir) -> Result<crate::narinfo::NarInfo, Error> {
     let mut draft = Draft::default();
     for line in body.lines().filter(|line| !line.is_empty()) {
-        let (key, value) = line.split_once(": ").context(LineSnafu { line })?;
+        // `Key: value` is what nix writes. A bare `Key:` is accepted as an empty value so a
+        // narinfo from another implementation, which may have dropped the trailing space on
+        // an empty `References`, still reads rather than failing the whole body.
+        let (key, value) = match line.split_once(": ") {
+            Some(split) => split,
+            None => (line.strip_suffix(':').context(LineSnafu { line })?, ""),
+        };
         let Ok(field) = core::str::FromStr::from_str(key) else {
             continue;
         };
@@ -258,6 +264,17 @@ mod tests {
             crate::narinfo::parse::parse(&body, &dir()),
             Err(crate::narinfo::parse::Error::NarSizeZero)
         ));
+    }
+
+    /// Another implementation may drop the trailing space on an empty `References`. Reading
+    /// that is harmless; writing it is not, which is why only the parser is lenient.
+    #[test]
+    fn accepts_a_bare_key_as_an_empty_value() {
+        let body = crate::narinfo::tests::sample()
+            .render(&dir())
+            .replace("References: 5rnvz", "References:\nIgnored: 5rnvz");
+        let parsed = crate::narinfo::parse::parse(&body, &dir()).expect("parses");
+        assert!(parsed.references.is_empty());
     }
 
     #[test]

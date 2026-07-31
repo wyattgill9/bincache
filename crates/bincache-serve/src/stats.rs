@@ -20,8 +20,12 @@ pub struct Shard {
     pub payload_bytes: core::sync::atomic::AtomicU64,
     pub uploads: core::sync::atomic::AtomicU64,
     pub rejections: core::sync::atomic::AtomicU64,
-    /// Seconds since the process epoch at the shard's last loop turn.
+    /// Milliseconds since the counters were created, at the shard's last heartbeat.
+    /// Milliseconds rather than seconds so a stall is visible well inside one scrape.
     pub heartbeat: core::sync::atomic::AtomicU64,
+    /// How many times this shard has beaten. Zero means it has not started, which a
+    /// timestamp alone cannot express: a shard that beat immediately also reads zero.
+    pub heartbeats: core::sync::atomic::AtomicU64,
 }
 
 impl Shard {
@@ -30,16 +34,15 @@ impl Shard {
     pub fn bump(counter: &core::sync::atomic::AtomicU64, by: u64) {
         counter.fetch_add(by, Ordering::Relaxed);
     }
-
-    pub fn beat(&self, elapsed: core::time::Duration) {
-        self.heartbeat.store(elapsed.as_secs(), Ordering::Relaxed);
-    }
 }
 
 /// One padded slot per shard, shared with the harvester and the watchdog.
 #[derive(Clone)]
 pub struct Shards {
     slots: std::sync::Arc<[crossbeam_utils::CachePadded<Shard>]>,
+    /// The epoch heartbeats are measured against. Owned here so no caller has to carry an
+    /// `Instant` alongside the counters and keep the two agreeing.
+    started: std::time::Instant,
 }
 
 impl Shards {
@@ -47,7 +50,14 @@ impl Shards {
     pub fn new(count: core::num::NonZeroUsize) -> Self {
         let slots: Vec<crossbeam_utils::CachePadded<Shard>> =
             (0..count.get()).map(|_| crossbeam_utils::CachePadded::new(Shard::default())).collect();
-        Self { slots: slots.into() }
+        Self { slots: slots.into(), started: std::time::Instant::now() }
+    }
+
+    /// Records that this shard's executor is still turning.
+    pub fn beat(&self, shard: usize) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.slots[shard].heartbeat.store(elapsed, Ordering::Relaxed);
+        self.slots[shard].heartbeats.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]
@@ -80,18 +90,23 @@ impl Shards {
         totals
     }
 
-    /// Shards whose heartbeat is older than `stale`, measured against `now`. A non-empty
-    /// answer means a shard is wedged, which is exactly the failure a chunked-send
-    /// discipline is meant to prevent and therefore the one worth watching for.
+    /// Shards whose heartbeat is older than `stale`. A non-empty answer means a shard is
+    /// wedged, which is exactly the failure a chunked-send discipline is meant to prevent
+    /// and therefore the one worth watching for.
+    ///
+    /// A shard that has never beaten is not reported: it has not started, which is not the
+    /// same as being stuck.
     #[must_use]
-    pub fn stalled(&self, now: core::time::Duration, stale: core::time::Duration) -> Vec<usize> {
-        let deadline = now.as_secs().saturating_sub(stale.as_secs());
+    pub fn stalled(&self, stale: core::time::Duration) -> Vec<usize> {
+        let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let stale = u64::try_from(stale.as_millis()).unwrap_or(u64::MAX);
+        let deadline = now.saturating_sub(stale);
         self.slots
             .iter()
             .enumerate()
             .filter(|(_, slot)| {
-                let beat = slot.heartbeat.load(Ordering::Relaxed);
-                beat != 0 && beat < deadline
+                let started = slot.heartbeats.load(Ordering::Relaxed) > 0;
+                started && slot.heartbeat.load(Ordering::Relaxed) < deadline
             })
             .map(|(shard, _)| shard)
             .collect()
@@ -150,16 +165,23 @@ mod tests {
         assert_eq!(totals.metadata_misses, 0);
     }
 
+    /// A shard parked in `accept` with no traffic still beats, so silence means wedged.
+    /// Shards 0 and 2 never beat: they have not started, which is a different thing and
+    /// must not be reported.
     #[test]
     fn a_shard_that_stopped_beating_is_reported() {
         let shards = shards(3);
-        shards.get(0).beat(core::time::Duration::from_secs(100));
-        shards.get(1).beat(core::time::Duration::from_secs(10));
-        // Shard 2 never beat: it has not started, which is not the same as being stuck.
+        shards.beat(1);
+        std::thread::sleep(core::time::Duration::from_millis(60));
+        assert_eq!(shards.stalled(core::time::Duration::from_millis(10)), vec![1]);
+    }
 
-        let now = core::time::Duration::from_secs(100);
-        let stale = core::time::Duration::from_secs(30);
-        assert_eq!(shards.stalled(now, stale), vec![1]);
+    #[test]
+    fn a_shard_that_kept_beating_is_not_reported() {
+        let shards = shards(2);
+        shards.beat(0);
+        shards.beat(1);
+        assert_eq!(shards.stalled(core::time::Duration::from_secs(30)), Vec::new());
     }
 
     #[test]

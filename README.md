@@ -1,16 +1,173 @@
 # bincache
 
-A Nix binary cache origin, built to find where the ceiling sits for this workload when you
-spend thread-per-core, io_uring, and content-addressed storage on it.
+A Nix binary cache origin you run yourself. Build nodes push store paths to it, and other
+machines substitute from it instead of rebuilding.
 
-It is a performance-research vehicle, and that framing carries two obligations: it has to
-be correct against real clients before anything else, and every optimization has to arrive
-with a before/after number. `research/DESIGN_V2.md` is the argument; `ARCHITECTURE.md` is
-the map.
+It speaks the binary cache protocol that `nix copy` and `substituters` already use, so
+clients need a URL and a public key and no patching.
 
-## What it does
+It is also a performance-research vehicle for the question of where the ceiling sits on
+this workload given thread-per-core, io_uring, and content-addressed storage.
+`research/DESIGN_V2.md` is the argument and `ARCHITECTURE.md` is the map. Neither is
+required reading to run the thing.
 
-Three routes, which is the whole protocol:
+## Before you start
+
+**io_uring has to be available.** Docker 25.0.0+ and containerd's `RuntimeDefault` seccomp
+profile block it, and Kubernetes inherits that. Run bincache on bare metal, or in a
+container whose seccomp profile permits `io_uring_setup`, `io_uring_enter`, and
+`io_uring_register`. Default-profile containers are unsupported. On a platform with no
+io_uring at all, Compio falls back to a polling driver and everything still works, without
+the io_uring wins.
+
+**There is no TLS.** Terminate it in front, or keep the cache on a trusted network.
+
+**There is no garbage collection.** The cache grows until you delete something.
+
+Clients need Nix 2.4 or newer, because every artifact is stored as zstd.
+
+## Set it up
+
+```sh
+cargo build --release
+cp target/release/bincache /usr/local/bin/bincache
+mkdir -p /var/lib/bincache
+```
+
+Generate a signing key. The secret goes to stdout and the public key to stderr, so redirect
+them separately and keep the line stderr prints: every client that reads from this cache
+needs it.
+
+```sh
+bincache keygen --name cache.example.org-1 > /var/lib/bincache/secret.key
+# stderr: trusted-public-keys entry: cache.example.org-1:<base64>
+```
+
+Generate a push credential for each build node that will upload:
+
+```sh
+bincache token >> /var/lib/bincache/push.token
+```
+
+Then serve:
+
+```sh
+bincache serve \
+    --data-dir /var/lib/bincache \
+    --secret-key-file /var/lib/bincache/secret.key \
+    --push-token-file /var/lib/bincache/push.token \
+    --listen 0.0.0.0:5000
+```
+
+With no push credential configured the cache is read-only, which is a reasonable way to run
+a replica. Every setting also takes an environment variable, and `bincache serve --help`
+is the full list. The ones worth knowing:
+
+| Setting | Default | What it changes |
+|---|---|---|
+| `--listen` | `0.0.0.0:5000` | every shard binds it with `SO_REUSEPORT` |
+| `--shards` | reported parallelism | independent accept loops |
+| `--pin` | off | pin each shard to a core, for a dedicated box |
+| `--zstd-level` | `3` | compression applied once, at ingest |
+| `--priority` | `30` | lower wins when several caches hold a path; `cache.nixos.org` is 40 |
+| `--want-mass-query` | `true` | whether `nix-cache-info` invites the bulk narinfo queries closure resolution produces |
+
+## Push to it
+
+```sh
+nix copy --to 'http://bincache:<token>@cache.example.org:5000?compression=none' /nix/store/...
+```
+
+`?compression=none` is required. bincache verifies the NAR hash over the bytes the protocol
+defines and produces the zstd artifact itself, so it needs the uncompressed stream. Leave
+the setting off and the push is refused, with the reason in the response body.
+
+The username in the URI is ignored; only the token matters. The credential can also go in
+netrc or an `Authorization: Bearer` header. Prefer netrc when the pushing user is trusted on
+that machine, since it keeps the token out of the process table:
+
+```
+machine cache.example.org login bincache password <token>
+```
+
+Nix refuses a client-specified `netrc-file` for an untrusted user, which is why the URI form
+exists.
+
+A push is two requests per path: the NAR, then the narinfo that publishes it. Both travel on
+one connection, so pushing a whole closure is one handshake.
+
+### When a push is refused
+
+bincache answers `400` and says why in the body, and `nix copy` prints that under
+`response body:`. The ones you are likely to see:
+
+| Message | Cause |
+|---|---|
+| `...Point the client at the cache with ?compression=none` | the setting is missing from the store URI |
+| `uploaded bytes hash to X but the request target declares Y` | the upload was corrupted in transit |
+| `no NAR with hash X has been uploaded` | a narinfo was published before its NAR |
+| `an uploaded NAR must not be empty` | Nix rejects a zero `NarSize`, so bincache will not store one |
+
+A `401` means the token was missing or wrong. A `500` means the cache itself failed, and the
+reason is in the server log rather than the response; retrying is reasonable.
+
+## Read from it
+
+In `nix.conf`, using the line `keygen` printed to stderr:
+
+```
+substituters = http://cache.example.org:5000
+trusted-public-keys = cache.example.org-1:<base64>
+```
+
+Nix then substitutes from bincache the same way it substitutes from `cache.nixos.org`: it
+fetches the narinfo, checks the signature against `trusted-public-keys`, downloads the zstd
+NAR, and verifies `NarHash` before writing anything into the store. A path bincache did not
+sign is refused.
+
+Two things that will otherwise cost you an afternoon:
+
+- **A non-trusted user cannot add substituters.** If your account is not in `trusted-users`,
+  the daemon ignores `--substituters` and `--trusted-public-keys` on the command line and
+  says nothing about it. Put the cache in `nix.conf` and restart the daemon, or test against
+  a standalone store with `--store /some/path`, which bypasses the daemon.
+- **A client caches misses for an hour** (`narinfo-cache-negative-ttl`, 3600 seconds). Push
+  a path the client has already asked for and it keeps reporting the path as absent, so a
+  cache that is working correctly looks broken. `--refresh` bypasses the cached miss, and
+  so does testing with a path that client has never asked for.
+
+Interrupted downloads resume: NAR responses advertise `Accept-Ranges: bytes` and serve
+`206` for a range request, so a dropped transfer picks up where it stopped rather than
+restarting.
+
+## Operate it
+
+`GET /metrics` serves Prometheus text: request counts, metadata hit and miss counts, bytes
+served, uploads, rejections, and the number of paths held.
+
+Three subcommands need the server stopped, because `redb` allows one writer process at a
+time:
+
+```sh
+bincache reconcile --data-dir /var/lib/bincache   # payload tree against index, both ways
+bincache delete    --data-dir /var/lib/bincache <32-char store path hash>
+bincache rotate    --data-dir /var/lib/bincache --secret-key-file <new key>
+```
+
+`rotate` replaces the signature on every record rather than adding one, so the old public
+key verifies nothing the server serves afterwards. Two things follow, and getting them
+backwards is how a rotation breaks a build farm:
+
+- Add the new public key to every client's `trusted-public-keys` before you rotate. Keep
+  the old one listed until every client has refetched.
+- A client that already fetched a narinfo keeps the old signature for
+  `narinfo-cache-positive-ttl`, which defaults to 30 days. Until it expires, that client
+  verifies against the old key and fails against the new one alone. `nix copy --refresh`
+  bypasses the cache for a given path; there is no way to invalidate it from the server.
+
+## The protocol surface
+
+Three routes, which is all of it. `PUT` on the same shapes is the push side.
 
 | Route | Returns |
 |---|---|
@@ -18,88 +175,19 @@ Three routes, which is the whole protocol:
 | `GET`, `HEAD /<hash>.narinfo` | the signed manifest for one store path, or 404 |
 | `GET /nar/<file hash>.nar.zst` | the compressed NAR, resumable |
 
-Pushes arrive as `PUT` on the same shapes, authenticated with a per-node token. The server
-verifies the NAR hash against the request target, compresses to zstd itself, and signs with
-a key that never leaves the box.
+The signing key never leaves the server. Client `Sig` lines in a pushed narinfo are
+discarded and the record is re-signed locally, so a compromised build node can poison only
+the paths it uploads, and only until you delete them.
 
-## Running it
-
-```sh
-cargo build --release
-
-# The secret goes to stdout; the trusted-public-keys entry goes to stderr.
-./target/release/bincache keygen --name cache.example.org-1 > /var/lib/bincache/secret.key
-
-./target/release/bincache token > /var/lib/bincache/push.token
-
-./target/release/bincache serve \
-    --data-dir /var/lib/bincache \
-    --secret-key-file /var/lib/bincache/secret.key \
-    --push-token-file /var/lib/bincache/push.token \
-    --listen 0.0.0.0:5000
-```
-
-`bincache serve --help` lists every setting and its environment variable.
-
-### Pushing to it
+## Contributing
 
 ```sh
-nix copy --to 'http://bincache:<the token>@cache.example.org:5000?compression=none' /nix/store/...
-```
-
-`compression=none` is required. bincache verifies the NAR hash over the bytes the protocol
-defines and produces the zstd artifact itself, so it needs the uncompressed stream. A
-pre-compressed upload is refused with a message naming the setting.
-
-The credential can go in the URI as above, in netrc, or in an `Authorization: Bearer`
-header. The username is ignored. Prefer netrc when the pushing user is trusted on that
-machine, since it keeps the token out of the process table:
-
-```
-machine cache.example.org login bincache password <the token>
-```
-
-Nix refuses a client-specified `netrc-file` for an untrusted user, which is why the URI form
-exists.
-
-### Reading from it
-
-```
-substituters = http://cache.example.org:5000
-trusted-public-keys = cache.example.org-1:<the base64 from keygen>
-```
-
-Clients need Nix 2.4 or newer, because everything is stored as zstd.
-
-### Operating it
-
-`GET /metrics` serves Prometheus text. `bincache reconcile` compares the payload directory
-against the index in both directions, `bincache delete` removes one path, and
-`bincache rotate` re-signs every record under a new key. Those three need the server
-stopped, because `redb` allows one writer process at a time.
-
-There is no garbage collection. The cache grows until an operator deletes something.
-
-## Deployment requirements
-
-io_uring is blocked by default in Docker 25.0.0+ and in containerd's `RuntimeDefault`
-seccomp profile, which Kubernetes inherits. **bincache runs on bare metal, or in a
-container with a seccomp profile that permits `io_uring_setup`, `io_uring_enter`, and
-`io_uring_register`.** Default-profile containers are unsupported. On platforms without
-io_uring, Compio falls back to a polling driver and everything still works, minus the
-io_uring-specific wins.
-
-TLS is not implemented. Terminate it in front, or wait for the in-process `rustls` work.
-
-## Testing
-
-```sh
-cargo nextest run --workspace     # includes conformance against a real socket
+cargo nextest run --workspace       # includes conformance against a real socket
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
 
-Three layers, in increasing strength.
+Three layers of test, in increasing strength.
 
 `crates/bincache-serve/tests/conformance.rs` runs a real shard on a real socket and asserts
 the exact bytes a Nix client depends on. It is part of `cargo nextest run`.
@@ -114,22 +202,19 @@ python3 scripts/conformance.py \
     --public-key 'cache.example.org-1:<base64>'
 ```
 
-`scripts/e2e-nix.py` is the one that actually proves it. It starts a fresh cache, pushes a
+`scripts/e2e-nix.py` is the one that proves it works. It starts a fresh cache, pushes a
 freshly built path with `nix copy --to`, reads the record back with `nix path-info`, and
-substitutes it into a separate store with `nix copy --from`, which makes the client verify
-the signature, decompress, and check `NarHash` before writing anything. It then repeats that
-last step with a key the cache did not sign with and requires the client to refuse.
+substitutes it into a separate store, which makes a real client verify the signature,
+decompress, and check `NarHash` before writing anything. It then repeats that last step with
+a key the cache did not sign with and requires the client to refuse.
 
 ```sh
 cargo build --release && python3 scripts/e2e-nix.py
 ```
 
-Two things that will otherwise waste an afternoon, both learned the hard way here. The
-destination has to be a store (`--to /some/path`), not a binary cache (`--to file://...`):
-a binary cache destination re-uploads without checking signatures, so a test using one
-passes even when the signature is wrong. And a client caches negative narinfo lookups for
-an hour with a floor `--refresh` cannot lower, so testing a path the client has ever missed
-on reports a failure that is not one; the script builds a unique path per run to avoid it.
+The destination has to be a store (`--to /some/path`), not a binary cache
+(`--to file://...`). A binary cache destination re-uploads without checking signatures, so a
+test using one passes even when the signature is wrong.
 
 ## Layout
 

@@ -99,9 +99,13 @@ cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
 
-`crates/bincache-serve/tests/conformance.rs` runs a real shard and asserts the exact bytes a
-Nix client depends on. `scripts/conformance.py` does the same against a running process and
-additionally verifies the served signature the way a client verifies it:
+Three layers, in increasing strength.
+
+`crates/bincache-serve/tests/conformance.rs` runs a real shard on a real socket and asserts
+the exact bytes a Nix client depends on. It is part of `cargo nextest run`.
+
+`scripts/conformance.py` asserts the same against a running process, and additionally
+verifies the served signature the way a client does, over the canonical fingerprint:
 
 ```sh
 python3 scripts/conformance.py \
@@ -109,6 +113,23 @@ python3 scripts/conformance.py \
     --token "$(cat push.token)" \
     --public-key 'cache.example.org-1:<base64>'
 ```
+
+`scripts/e2e-nix.py` is the one that actually proves it. It starts a fresh cache, pushes a
+freshly built path with `nix copy --to`, reads the record back with `nix path-info`, and
+substitutes it into a separate store with `nix copy --from`, which makes the client verify
+the signature, decompress, and check `NarHash` before writing anything. It then repeats that
+last step with a key the cache did not sign with and requires the client to refuse.
+
+```sh
+cargo build --release && python3 scripts/e2e-nix.py
+```
+
+Two things that will otherwise waste an afternoon, both learned the hard way here. The
+destination has to be a store (`--to /some/path`), not a binary cache (`--to file://...`):
+a binary cache destination re-uploads without checking signatures, so a test using one
+passes even when the signature is wrong. And a client caches negative narinfo lookups for
+an hour with a floor `--refresh` cannot lower, so testing a path the client has ever missed
+on reports a failure that is not one; the script builds a unique path per run to avoid it.
 
 ## Layout
 

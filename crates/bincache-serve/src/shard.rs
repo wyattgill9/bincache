@@ -170,10 +170,8 @@ async fn session(
 ) -> Result<(), crate::handler::Error> {
     let mut connection = crate::connection::Connection::new(stream);
     loop {
-        let head = match connection.head().await {
-            Ok(Some(head)) => head,
-            Ok(None) => return Ok(()),
-            Err(error) => return Err(crate::handler::Error::Connection { source: error }),
+        let Some(head) = connection.head().await.context(crate::handler::ConnectionSnafu)? else {
+            return Ok(());
         };
 
         let Ok(request) = crate::http::parse(&head) else {
@@ -182,10 +180,7 @@ async fn session(
                 crate::http::KeepAlive::Close,
                 0,
             );
-            connection
-                .write(bytes)
-                .await
-                .map_err(|source| crate::handler::Error::Connection { source })?;
+            connection.write(bytes).await.context(crate::handler::ConnectionSnafu)?;
             return Ok(());
         };
 

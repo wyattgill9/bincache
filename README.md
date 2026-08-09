@@ -18,6 +18,9 @@ need a URL and a public key.
 
 ## Set it up
 
+`nix build` produces the same binary at `result/bin/bincache` if you would rather not build
+from a checkout.
+
 ```sh
 cargo build --release
 cp target/release/bincache /usr/local/bin/bincache
@@ -117,11 +120,18 @@ can poison only the paths it uploads, and only until you delete them.
 
 ## Contributing
 
+`direnv allow` (or `nix develop`) puts the pinned toolchain, `cargo-nextest`, and the Python
+the scripts below import into your shell. `rust-toolchain.toml` is the pin, so rustup users
+get the same compiler without Nix.
+
 ```sh
 cargo nextest run --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 ```
+
+`nix flake check` runs the clippy and nextest gates plus formatting in the sandbox, which is
+what CI does.
 
 Three layers of test, in increasing strength:
 

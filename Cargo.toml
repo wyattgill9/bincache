@@ -53,6 +53,10 @@ cast_possible_truncation = "deny"
 cast_precision_loss = "deny"
 cast_sign_loss = "deny"
 
+# crane reads this for the deps-only/clippy/test derivations (no root [package] here).
+[workspace.metadata.crane]
+name = "bincache"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

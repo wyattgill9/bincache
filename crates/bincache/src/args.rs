@@ -74,7 +74,7 @@ pub struct Serve {
 
     /// Serving shards. Defaults to the parallelism the machine reports.
     #[arg(long, env = "BINCACHE_SHARDS")]
-    pub shards: Option<core::num::NonZeroUsize>,
+    pub shards: Option<core::num::NonZeroU16>,
 
     /// Pin each shard to a core. The point of the architecture on a dedicated box, and
     /// the wrong default on a shared one.
@@ -99,7 +99,8 @@ pub struct Serve {
           default_value_t = true)]
     pub want_mass_query: bool,
 
-    /// How long a shard may go without a heartbeat before the watchdog says so.
+    /// How long a shard may go without a heartbeat before the watchdog says so. The
+    /// watchdog samples once a second, so this has to be longer than that.
     #[arg(long, env = "BINCACHE_STALL_SECONDS", default_value_t = 30)]
     pub stall_seconds: u64,
 }

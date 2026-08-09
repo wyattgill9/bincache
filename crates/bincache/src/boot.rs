@@ -42,6 +42,9 @@ pub enum Error {
     #[snafu(display("the machine reported no available parallelism"))]
     Parallelism { source: std::io::Error },
 
+    #[snafu(display("the machine reports more CPUs than a shard index can address"))]
+    ShardCount { source: core::num::TryFromIntError },
+
     #[snafu(display("the payload directory could not be opened"))]
     Store { source: bincache_store::nar::Error },
 
@@ -83,7 +86,10 @@ fn serve(args: crate::args::Serve) -> Result<(), Error> {
         .context(ZstdLevelSnafu { level: args.zstd_level })?;
     let shards = match args.shards {
         Some(shards) => shards,
-        None => std::thread::available_parallelism().context(ParallelismSnafu)?,
+        None => core::num::NonZeroU16::try_from(
+            std::thread::available_parallelism().context(ParallelismSnafu)?,
+        )
+        .context(ShardCountSnafu)?,
     };
 
     let artifacts = open(&args.storage)?;
@@ -115,7 +121,7 @@ fn serve(args: crate::args::Serve) -> Result<(), Error> {
         level,
     });
 
-    let stats = bincache_serve::stats::Shards::new(shards);
+    let stats = bincache_serve::stats::Shards::new(core::num::NonZeroUsize::from(shards));
     let cache = bincache_serve::handler::Cache::new(bincache_serve::handler::Parts {
         ingest,
         tokens,
@@ -128,20 +134,19 @@ fn serve(args: crate::args::Serve) -> Result<(), Error> {
             },
             priority: bincache_core::cacheinfo::Priority(args.priority),
         },
-        stats: stats.clone(),
+        stats,
     });
-
-    crate::watchdog::spawn(stats, core::time::Duration::from_secs(args.stall_seconds));
 
     bincache_serve::shard::run(
         bincache_serve::shard::Config {
             address: args.listen,
             shards,
-            pinning: if args.pin {
-                bincache_serve::shard::Pinning::Pinned
+            pin: if args.pin {
+                selene::shard::Affinity::Auto
             } else {
-                bincache_serve::shard::Pinning::Unpinned
+                selene::shard::Affinity::Off
             },
+            stall: core::time::Duration::from_secs(args.stall_seconds),
         },
         cache,
     )

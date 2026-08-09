@@ -89,6 +89,10 @@ Two things that will otherwise cost you an afternoon:
 `GET /metrics` serves Prometheus text: request counts, metadata hits and misses, bytes
 served, uploads, rejections, and paths held.
 
+`SIGINT` or `SIGTERM` stops accepting, gives open connections ten seconds to finish, and
+exits 0. A client holding an idle keep-alive connection costs the full ten seconds, so a
+restart under load is not instant.
+
 These need the server stopped, because `redb` allows one writer process:
 
 ```sh
@@ -135,8 +139,8 @@ what CI does.
 
 Three layers of test, in increasing strength:
 
-- `crates/bincache-serve/tests/conformance.rs` runs a shard on a real socket and asserts the
-  exact bytes a Nix client depends on. Part of `cargo nextest run`.
+- `crates/bincache-serve/tests/conformance.rs` runs the shard service on a real socket and
+  asserts the exact bytes a Nix client depends on. Part of `cargo nextest run`.
 - `scripts/conformance.py` asserts the same against a running process, and verifies the
   served signature over the canonical fingerprint the way a client does.
 - `scripts/e2e-nix.py` is the one that proves it works. It pushes a freshly built path,
@@ -159,6 +163,6 @@ crates/
   bincache-index/    redb schema, rkyv records
   bincache-store/    content-addressed NAR files, atomic placement, orphan scan
   bincache-ingest/   upload state machine, publish, auth, maintenance
-  bincache-serve/    shards, HTTP/1.1, routing, ranges, counters
+  bincache-serve/    HTTP/1.1, routing, ranges, counters, the per-shard service
   bincache/          config, boot, wiring
 ```

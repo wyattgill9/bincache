@@ -11,11 +11,12 @@ bincache-ingest = { workspace = true }
 bincache-store  = { workspace = true }
 
 bytes           = { workspace = true }
-compio          = { workspace = true, features = ["net", "io", "runtime", "time"] }
-core_affinity   = { workspace = true }
+compio          = { workspace = true, features = ["net", "io", "runtime", "signal", "time"] }
 crossbeam-utils = { workspace = true }
+futures-util    = { workspace = true }
+nix             = { workspace = true }
+selene          = { workspace = true }
 snafu           = { workspace = true }
-socket2         = { workspace = true }
 strum           = { workspace = true }
 swrite          = { workspace = true }
 tracing         = { workspace = true }

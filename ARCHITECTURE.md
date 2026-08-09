@@ -7,9 +7,9 @@ Orientation doc. Read this to reload the whole system into your head, then go to
 
 V1 is implemented and serves the protocol end to end. A `nix copy --to` push lands, a
 `GET` of the narinfo returns a signed record, and the NAR streams back and decompresses to
-what was uploaded. `crates/bincache-serve/tests/conformance.rs` runs a real shard on a real
-socket and asserts that; `scripts/conformance.py` does the same against a running process,
-including verifying the ed25519 signature the way a client verifies it.
+what was uploaded. `crates/bincache-serve/tests/conformance.rs` runs the real shard service
+on a real socket and asserts that; `scripts/conformance.py` does the same against a running
+process, including verifying the ed25519 signature the way a client verifies it.
 
 Deferred on purpose, with the reasoning in `research/DESIGN_V2.md`: the RAM projection in
 front of `redb`, TLS, HTTP/2, garbage collection, and the negative-lookup filter tier.
@@ -52,8 +52,14 @@ Crates split by who owns what, not by feature.
   reader handles, and the scan that finds orphans.
 - **`bincache-ingest`** is the only writer. The typestate upload machine, the publish, push
   auth, and the maintenance operations.
-- **`bincache-serve`** is the readers: shards, HTTP/1.1, routing, ranges, counters.
+- **`bincache-serve`** is the readers: HTTP/1.1, routing, ranges, counters, and the
+  `selene::listener::Service` a shard runs one connection through.
 - **`bincache`** is wiring. The only crate that knows the other five exist together.
+
+The shard pool itself is [selene](https://github.com/wyattgill9/selene): one thread per
+shard, each with its own Compio runtime, its own `SO_REUSEPORT` listener, its own
+connection registry, and the stall watchdog. `bincache-serve` supplies the `Service` and
+nothing else about the execution model.
 
 Dependency direction, which is also the layering:
 
@@ -118,8 +124,9 @@ A pre-compressed upload is refused with a message naming the setting.
 ### Boot
 
 Open the payload directory and the `redb` file, sweep staging files a crash may have left,
-start the watchdog, start the shards. There is no snapshot to validate and no log to
-replay: a `redb` commit is the publish.
+start the shards. There is no snapshot to validate and no log to replay: a `redb` commit is
+the publish. Shutdown is the mirror: `SIGINT` or `SIGTERM` stops the accept loops, gives
+open connections ten seconds to finish, and returns.
 
 ## The two connectors
 

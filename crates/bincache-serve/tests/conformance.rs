@@ -10,6 +10,7 @@
 
 use compio::io::AsyncRead as _;
 use compio::io::AsyncWriteExt as _;
+use selene::listener::Service as _;
 
 /// A minimal but genuine `nix-archive-1` serialization of one regular file, so the NAR
 /// hash under test is a hash of something a client could actually have produced.
@@ -90,10 +91,23 @@ impl Server {
             ),
         });
 
-        // Port zero: the kernel picks, so parallel test binaries never collide.
+        // Port zero: the kernel picks, so parallel test binaries never collide. That rules
+        // out a real selene pool, which needs a concrete port for `SO_REUSEPORT`, so the
+        // accept loop is local here and the shard's `Service` below it is the real one.
         let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
         let address = listener.local_addr().expect("has an address");
-        compio::runtime::spawn(bincache_serve::shard::accept(0, listener, cache)).detach();
+        let shard = bincache_serve::shard::Shard::new(cache, 0);
+        compio::runtime::spawn(async move {
+            loop {
+                let (stream, peer) = listener.accept().await.expect("accepts");
+                let shard = shard.clone();
+                compio::runtime::spawn(async move {
+                    shard.serve(stream, peer).await.expect("the service never fails");
+                })
+                .detach();
+            }
+        })
+        .detach();
 
         Self { address, token, key: secret.public(), dir }
     }

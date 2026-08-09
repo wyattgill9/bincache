@@ -15,6 +15,7 @@ clap               = { workspace = true }
 compio             = { workspace = true, features = ["runtime"] }
 mimalloc           = { workspace = true }
 redb               = { workspace = true }
+selene             = { workspace = true }
 snafu              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

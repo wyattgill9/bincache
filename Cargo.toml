@@ -11,22 +11,26 @@ publish = false
 bytes           = { version = "1.12" }
 clap            = { version = "4.6", features = ["derive", "env"] }
 compio          = { version = "0.19", features = ["macros", "runtime"] }
-core_affinity   = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 data-encoding   = { version = "2.9" }
 mimalloc        = { version = "0.1" }
 derive_more     = { version = "2.1", features = ["as_ref", "display", "from"] }
 ed25519-dalek   = { version = "3.0", features = ["rand_core"] }
 expect-test     = { version = "1.5" }
+futures-util    = { version = "0.3", default-features = false }
+# Already in the tree under `compio-signal`; taken directly for the two signal numbers.
+nix             = { version = "0.31", features = ["signal"] }
 rand            = { version = "0.9" }
 redb            = { version = "4.1" }
 # `unaligned` so an archive can be validated straight out of a `redb` value, which hands
 # back a byte slice at whatever alignment its page put it. `little_endian` so the on-disk
 # format does not change meaning on a big-endian or differently-tuned build.
 rkyv            = { version = "0.8", features = ["unaligned", "little_endian"] }
+# Pinned by rev: selene is unpublished, so a branch name would move the data plane
+# under a `cargo update`.
+selene          = { git = "https://github.com/wyattgill9/selene.git", rev = "49b3722c00fb8659aa44d2fdda9ae1c691c90c51" }
 sha2            = { version = "0.11" }
 snafu           = { version = "0.9" }
-socket2         = { version = "0.6" }
 strum           = { version = "0.28", features = ["derive"] }
 subtle          = { version = "2.6" }
 swrite          = { version = "0.1" }

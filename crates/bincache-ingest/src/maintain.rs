@@ -108,7 +108,7 @@ pub fn rotate(
         record.resign(dir, key);
     }
     for batch in records.chunks(BATCH) {
-        index.republish(batch).context(IndexSnafu)?;
+        index.republish(batch, dir).context(IndexSnafu)?;
         tracing::info!(rotated = batch.len(), total = rotated, "re-signing");
     }
     Ok(rotated)

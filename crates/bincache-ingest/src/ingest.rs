@@ -149,7 +149,7 @@ impl Ingest {
         };
         record.resign(&self.dir, &self.key);
 
-        self.index.publish(&record).context(IndexSnafu)?;
+        self.index.publish(&record, &self.dir).context(IndexSnafu)?;
         tracing::info!(path = %record.store_path, "published");
         Ok(record)
     }
@@ -407,7 +407,7 @@ mod tests {
                 record
             })
             .collect();
-        ingest.index().republish(&clones).expect("seeds");
+        ingest.index().republish(&clones, ingest.dir()).expect("seeds");
         let total = ingest.index().count().expect("counts");
         assert_eq!(total, count + 1, "one real publish plus the clones");
 
@@ -447,6 +447,16 @@ mod tests {
             key.public()
                 .verify(&record.fingerprint(ingest.dir()), &record.sigs[0])
                 .expect("verifies under the new key");
+
+            // What a client actually receives. A rotation that re-signed the records and
+            // left the projection alone would keep serving the old signature, and the
+            // README's rotation procedure would silently do nothing.
+            let body = ingest
+                .index()
+                .body(record.store_path.hash(), ingest.dir())
+                .expect("reads")
+                .expect("present");
+            assert_eq!(String::from_utf8(body).expect("utf8"), record.render(ingest.dir()));
         }
     }
 }

@@ -482,7 +482,7 @@ impl Cache {
         status: crate::http::response::Status,
         drained: Drained,
     ) -> Result<crate::http::KeepAlive, Error> {
-        let unread = drained == Drained::Unread && exchange.request.body_len() > 0;
+        let unread = drained == Drained::Unread && exchange.request.carries_body();
         let keep_alive =
             if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
         let head = crate::http::response::bare(status, keep_alive, 0);
@@ -506,7 +506,7 @@ impl Cache {
             return self.answer(exchange, status, drained).await;
         };
 
-        let unread = drained == Drained::Unread && exchange.request.body_len() > 0;
+        let unread = drained == Drained::Unread && exchange.request.carries_body();
         let keep_alive =
             if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
         let mut head = crate::http::response::Head::new(status, keep_alive);

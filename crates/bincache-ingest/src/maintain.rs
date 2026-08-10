@@ -8,14 +8,16 @@
 
 use snafu::ResultExt as _;
 
+/// Records re-signed per `redb` transaction during a rotation. Large enough that the fsync
+/// per commit is amortized, small enough that the pending writes of one batch are a bounded
+/// amount of memory.
+const BATCH: usize = 1000;
+
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display("the index rejected the operation"))]
     Index { source: bincache_index::index::Error },
-
-    #[snafu(display("the artifact could not be unlinked"))]
-    Unlink { source: bincache_store::nar::Error },
 
     #[snafu(display("the payload directory could not be listed"))]
     Scan { source: bincache_store::nar::Error },
@@ -38,20 +40,23 @@ pub struct Reconciliation {
     pub unrecognized_files: Vec<std::path::PathBuf>,
 }
 
-/// Forget the record, then unlink the artifact.
+/// Forget the record. The artifact stays.
 ///
-/// That order is what makes an interrupted delete safe: it can leave an orphan artifact,
-/// which reconciliation collects, but never a record pointing at bytes that are gone. An
-/// in-flight stream holds its descriptor, so an unlinked file finishes streaming.
-pub async fn delete(
-    store: &bincache_store::nar::Store,
+/// Leaving it is deliberate. A NAR does not include the store path name, so two paths whose
+/// contents are identical produce the same `NarHash`, the same `FileHash`, and therefore
+/// one shared artifact on disk. Unlinking it here would strand the other path's narinfo
+/// pointing at bytes that are gone, which is the loudest failure this cache has: a client
+/// that resolved the metadata then asks for a NAR that is not there.
+///
+/// Deciding whether anything still references an artifact takes a pass over every record,
+/// which is what [`reconcile`] is for. Leaving it also makes a delete O(1).
+pub fn delete(
     index: &bincache_index::index::Index,
     key: &bincache_core::storepath::Hash,
 ) -> Result<Deleted, Error> {
     let Some(record) = index.unpublish(key).context(IndexSnafu)? else {
         return Ok(Deleted::Absent);
     };
-    store.remove(&record.nar()).await.context(UnlinkSnafu)?;
     tracing::info!(path = %record.store_path, "deleted");
     Ok(Deleted::Removed)
 }
@@ -88,16 +93,23 @@ pub fn reconcile(
 /// Re-signs every record under `key`. Clients see no interruption as long as both public
 /// keys sit in `trusted-public-keys` for the duration, which is what makes rotation a
 /// background pass rather than an outage.
+///
+/// Committed in batches. `redb` fsyncs per commit, so re-signing through the one-record
+/// publish used by a push meant one fsync per path: a million-path cache spent a million
+/// fsyncs on the procedure the README documents for key rotation.
 pub fn rotate(
     index: &bincache_index::index::Index,
     dir: &bincache_core::storepath::Dir,
     key: &bincache_core::sign::SecretKey,
 ) -> Result<usize, Error> {
-    let records = index.records().context(IndexSnafu)?;
+    let mut records = index.records().context(IndexSnafu)?;
     let rotated = records.len();
-    for mut record in records {
+    for record in &mut records {
         record.resign(dir, key);
-        index.publish(&record).context(IndexSnafu)?;
+    }
+    for batch in records.chunks(BATCH) {
+        index.republish(batch).context(IndexSnafu)?;
+        tracing::info!(rotated = batch.len(), total = rotated, "re-signing");
     }
     Ok(rotated)
 }

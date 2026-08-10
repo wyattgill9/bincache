@@ -21,7 +21,8 @@ pub enum Command {
     Keygen(Keygen),
     /// Generate a push token for one build node.
     Token,
-    /// Delete one path: its record, then its artifact. Needs the server stopped.
+    /// Delete one path's record. Its artifact stays, because another path may share
+    /// it; `reconcile` lists what is unreferenced. Needs the server stopped.
     Delete(Delete),
     /// Compare the payload directory against the index, in both directions. Needs the
     /// server stopped.

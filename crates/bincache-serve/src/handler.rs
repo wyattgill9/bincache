@@ -36,6 +36,17 @@ const SERVER: &str = "bincache";
 /// orders of magnitude of headroom and still bounds the buffer.
 pub const METADATA_BODY_MAX: usize = 1024 * 1024;
 
+/// Bytes read from an artifact per chunk on the way to the socket.
+///
+/// This is a throughput knob, not a style choice. `tokio::fs` hands every read to a
+/// blocking threadpool, so the chunk size sets how many thread handoffs a transfer costs:
+/// `ReaderStream`'s 4 KiB default turns an 8 MiB NAR into roughly two thousand of them, and
+/// measured at 0.5 GB/s against 8.6 GB/s for the same artifact read 256 KiB at a time.
+///
+/// Large enough that the handoff is amortized, small enough that a few hundred concurrent
+/// transfers are not a memory problem.
+const SEND_CHUNK: usize = 256 * 1024;
+
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -202,7 +213,7 @@ async fn narinfo(
         return publish(cache, parts, request).await;
     }
 
-    let published = cache.ingest.narinfo().read(&key).await.context(NarinfoSnafu)?;
+    let published = cache.ingest.narinfo().read(&key).context(NarinfoSnafu)?;
     let Some(published) = published else {
         cache.stats.metadata_miss();
         return Ok(bare(axum::http::StatusCode::NOT_FOUND));
@@ -246,11 +257,10 @@ async fn probe(
             .ingest
             .receipt()
             .read(&url.file_hash)
-            .await
             .context(ReceiptSnafu)?
             .map(|receipt| receipt.nar_size.get())
     } else {
-        let reader = cache.ingest.store().read(url).await.context(StoreSnafu)?;
+        let reader = cache.ingest.store().read(url).context(StoreSnafu)?;
         reader.map(|reader| reader.size())
     };
 
@@ -273,7 +283,7 @@ async fn stream(
     parts: &axum::http::request::Parts,
     url: &bincache_core::narurl::NarUrl,
 ) -> Result<axum::response::Response, Error> {
-    let Some(reader) = cache.ingest.store().read(url).await.context(StoreSnafu)? else {
+    let Some(reader) = cache.ingest.store().read(url).context(StoreSnafu)? else {
         return Ok(bare(axum::http::StatusCode::NOT_FOUND));
     };
     let size = reader.size();
@@ -313,9 +323,11 @@ async fn stream(
         );
     }
 
-    let file = reader.seek(span.first).await.context(StoreSnafu)?;
+    let file = reader.seek(span.first).context(StoreSnafu)?;
     let bounded = tokio::io::AsyncReadExt::take(file, span.len());
-    let payload = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(bounded));
+    let payload = axum::body::Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+        bounded, SEND_CHUNK,
+    ));
 
     cache.stats.payload(span.len());
     response.body(payload).context(BuildSnafu)

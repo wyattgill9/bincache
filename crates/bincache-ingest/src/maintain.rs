@@ -170,7 +170,7 @@ async fn read(
     dir: &bincache_core::storepath::Dir,
     key: &bincache_core::storepath::Hash,
 ) -> Result<Option<bincache_core::narinfo::NarInfo>, Error> {
-    let Some(raw) = narinfo.read(key).await.context(NarinfoSnafu)? else {
+    let Some(raw) = narinfo.read(key).context(NarinfoSnafu)? else {
         return Ok(None);
     };
     let body = String::from_utf8(raw).context(EncodingSnafu { key: *key })?;

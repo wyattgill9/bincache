@@ -37,11 +37,10 @@ impl Store {
 
     /// The body to answer a metadata request with. `None` is the common answer: closure
     /// resolution probes for paths the cache may not hold.
-    pub async fn read(
-        &self,
-        key: &bincache_core::storepath::Hash,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        self.dir.read(&name(key)).await.context(DirSnafu)
+    /// Synchronous: see [`crate::atomic::Dir::read`] for why the hot metadata path does
+    /// not go through a blocking threadpool.
+    pub fn read(&self, key: &bincache_core::storepath::Hash) -> Result<Option<Vec<u8>>, Error> {
+        self.dir.read(&name(key)).context(DirSnafu)
     }
 
     /// The publish. Everything expensive (compression, rendering, signing) already ran.
@@ -127,13 +126,13 @@ mod tests {
         let key = key(b"hello");
         let body = "StorePath: /nix/store/x\nReferences: \n";
 
-        assert_eq!(store.read(&key).await.expect("reads"), None);
+        assert_eq!(store.read(&key).expect("reads"), None);
         assert_eq!(
             store.write(&key, body).await.expect("publishes"),
             crate::atomic::Wrote::Created
         );
         assert_eq!(
-            store.read(&key).await.expect("reads"),
+            store.read(&key).expect("reads"),
             Some(body.as_bytes().to_vec()),
             "the served body must be byte-identical to the published one"
         );
@@ -175,7 +174,7 @@ mod tests {
         store.write(&key, "body").await.expect("publishes");
 
         assert_eq!(store.remove(&key).await.expect("removes"), crate::atomic::Removed::Deleted);
-        assert_eq!(store.read(&key).await.expect("reads"), None);
+        assert_eq!(store.read(&key).expect("reads"), None);
         assert_eq!(store.count().expect("counts"), 0);
         assert_eq!(store.remove(&key).await.expect("removes"), crate::atomic::Removed::Absent);
     }

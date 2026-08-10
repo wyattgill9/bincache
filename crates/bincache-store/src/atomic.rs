@@ -86,9 +86,21 @@ impl Dir {
     }
 
     /// `None` means absent, which is the routine answer on a cache and not a fault.
-    pub async fn read(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
+    ///
+    /// Reads synchronously, on the caller's task, on purpose. `tokio::fs` is not
+    /// asynchronous file I/O: it hands every operation to a blocking threadpool, so a
+    /// read that hits the page cache pays a thread handoff far larger than the read. On
+    /// the metadata path that measured as a 48% throughput loss and a p99 of 10ms against
+    /// 432us, all of it queueing for the pool.
+    ///
+    /// These files are a few hundred bytes and are the hottest thing the cache serves, so
+    /// the page cache answers essentially all of them in microseconds. A cold read does
+    /// block a worker, which is the same exposure the previous embedded database had when
+    /// it faulted in a B-tree page, and is why the payload plane (unbounded, frequently
+    /// cold) still streams through the pool.
+    pub fn read(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
         let path = self.path(name);
-        let read = tokio::fs::read(&path).await;
+        let read = std::fs::read(&path);
         if absent(&read) {
             return Ok(None);
         }
@@ -211,13 +223,13 @@ mod tests {
             dir.write("key", b"contents").await.expect("writes"),
             crate::atomic::Wrote::Created
         );
-        assert_eq!(dir.read("key").await.expect("reads"), Some(b"contents".to_vec()));
+        assert_eq!(dir.read("key").expect("reads"), Some(b"contents".to_vec()));
     }
 
     #[tokio::test]
     async fn reports_an_absent_name_rather_than_failing() {
         let dir = dir("absent").await;
-        assert_eq!(dir.read("missing").await.expect("reads"), None);
+        assert_eq!(dir.read("missing").expect("reads"), None);
         assert_eq!(dir.remove("missing").await.expect("removes"), crate::atomic::Removed::Absent);
     }
 
@@ -234,7 +246,7 @@ mod tests {
             dir.write("key", b"second").await.expect("rewrites"),
             crate::atomic::Wrote::Replaced
         );
-        assert_eq!(dir.read("key").await.expect("reads"), Some(b"second".to_vec()));
+        assert_eq!(dir.read("key").expect("reads"), Some(b"second".to_vec()));
         assert_eq!(dir.list().expect("lists"), vec!["key".to_owned()]);
     }
 

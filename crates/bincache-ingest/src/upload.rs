@@ -275,9 +275,9 @@ mod tests {
 
         assert_eq!(entry.nar_size.get(), u64::try_from(body.len()).expect("fits"));
 
-        assert_eq!(harness.receipts.read(&nar_hash).await.expect("reads"), Some(entry));
+        assert_eq!(harness.receipts.read(&nar_hash).expect("reads"), Some(entry));
 
-        let reader = harness.store.read(&entry.url()).await.expect("reads").expect("present");
+        let reader = harness.store.read(&entry.url()).expect("reads").expect("present");
         assert_eq!(reader.size(), entry.file_size);
     }
 
@@ -316,7 +316,7 @@ mod tests {
         assert!(matches!(refused, Err(crate::upload::Error::HashMismatch { .. })));
 
         assert_eq!(harness.store.scan().expect("scans").artifacts.len(), 0);
-        assert!(harness.receipts.read(&declared).await.expect("reads").is_none());
+        assert!(harness.receipts.read(&declared).expect("reads").is_none());
     }
 
     #[tokio::test]

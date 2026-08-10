@@ -98,14 +98,20 @@ impl Store {
 
     /// `None` means the artifact is absent, which is a routine answer on a cache and not a
     /// fault. Every other failure is typed.
-    pub async fn read(&self, url: &bincache_core::narurl::NarUrl) -> Result<Option<Reader>, Error> {
+    ///
+    /// The open and the `stat` are synchronous, for the reason given on
+    /// [`crate::atomic::Dir::read`]: `tokio::fs` routes each of them through a blocking
+    /// threadpool, and on a small artifact those two handoffs cost more than the transfer.
+    /// Only the bytes are streamed asynchronously, where the cost is amortized over a
+    /// chunk large enough to pay for the hop.
+    pub fn read(&self, url: &bincache_core::narurl::NarUrl) -> Result<Option<Reader>, Error> {
         let path = self.path(url);
-        let opened = tokio::fs::File::open(&path).await;
+        let opened = std::fs::File::open(&path);
         if absent(&opened) {
             return Ok(None);
         }
         let file = opened.context(OpenSnafu { path: path.clone() })?;
-        let metadata = file.metadata().await.context(MetadataSnafu { path: path.clone() })?;
+        let metadata = file.metadata().context(MetadataSnafu { path: path.clone() })?;
         Ok(Some(Reader { file, path, size: metadata.len() }))
     }
 
@@ -184,7 +190,7 @@ pub struct Scan {
 /// alive across an unlink, so a delete during a stream finishes the stream safely.
 #[derive(Debug)]
 pub struct Reader {
-    file: tokio::fs::File,
+    file: std::fs::File,
     path: std::path::PathBuf,
     size: u64,
 }
@@ -195,17 +201,20 @@ impl Reader {
         self.size
     }
 
-    /// Positions the artifact at `offset` and hands the descriptor over, so the caller can
-    /// stream the rest of it straight to a socket.
+    /// Positions the artifact at `offset` and hands it over as an async file, so the caller
+    /// can stream the rest of it straight to a socket.
+    ///
+    /// The seek is synchronous and the streaming is not, which is the split that matters: a
+    /// seek is one cheap syscall and would cost a threadpool handoff to do "properly",
+    /// while the transfer that follows is large enough to amortize one.
     ///
     /// Consuming `self` is deliberate: a positioned reader has state a second caller would
     /// not expect, and the size this type carried has already been used to resolve the
     /// range being served.
-    pub async fn seek(mut self, offset: u64) -> Result<tokio::fs::File, Error> {
-        tokio::io::AsyncSeekExt::seek(&mut self.file, std::io::SeekFrom::Start(offset))
-            .await
+    pub fn seek(mut self, offset: u64) -> Result<tokio::fs::File, Error> {
+        std::io::Seek::seek(&mut self.file, std::io::SeekFrom::Start(offset))
             .context(SeekSnafu { path: self.path.clone(), offset })?;
-        Ok(self.file)
+        Ok(tokio::fs::File::from_std(self.file))
     }
 }
 
@@ -330,7 +339,7 @@ mod tests {
 
     /// Everything a [`crate::nar::Reader`] has left to give, from `offset` on.
     async fn drain(reader: crate::nar::Reader, offset: u64) -> Vec<u8> {
-        let mut file = reader.seek(offset).await.expect("seeks");
+        let mut file = reader.seek(offset).expect("seeks");
         let mut read = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut file, &mut read).await.expect("reads");
         read
@@ -347,7 +356,7 @@ mod tests {
         assert_eq!(staged.written(), 11);
         assert_eq!(staged.commit(&store, &url).await.expect("commits"), 11);
 
-        let reader = store.read(&url).await.expect("reads").expect("present");
+        let reader = store.read(&url).expect("reads").expect("present");
         assert_eq!(reader.size(), 11);
         assert_eq!(drain(reader, 0).await, b"hello world");
     }
@@ -363,14 +372,14 @@ mod tests {
         staged.write(b"hello world").await.expect("writes");
         staged.commit(&store, &url).await.expect("commits");
 
-        let reader = store.read(&url).await.expect("reads").expect("present");
+        let reader = store.read(&url).expect("reads").expect("present");
         assert_eq!(drain(reader, 6).await, b"world");
     }
 
     #[tokio::test]
     async fn reports_an_absent_artifact_rather_than_failing() {
         let store = crate::nar::Store::open(root("absent")).await.expect("opens");
-        assert!(store.read(&url(b"missing")).await.expect("reads").is_none());
+        assert!(store.read(&url(b"missing")).expect("reads").is_none());
         assert_eq!(
             store.remove(&url(b"missing")).await.expect("removes"),
             crate::nar::Removed::Absent
@@ -386,7 +395,7 @@ mod tests {
             staged.write(b"partial").await.expect("writes");
             staged.abort().await.expect("aborts");
         }
-        assert!(store.read(&url).await.expect("reads").is_none());
+        assert!(store.read(&url).expect("reads").is_none());
         assert_eq!(store.scan().expect("scans").artifacts.len(), 0);
         assert_eq!(store.sweep_staging().await.expect("sweeps"), 0);
     }
@@ -430,7 +439,7 @@ mod tests {
         staged.write(b"streaming").await.expect("writes");
         staged.commit(&store, &url).await.expect("commits");
 
-        let reader = store.read(&url).await.expect("reads").expect("present");
+        let reader = store.read(&url).expect("reads").expect("present");
         assert_eq!(store.remove(&url).await.expect("removes"), crate::nar::Removed::Deleted);
 
         assert_eq!(drain(reader, 0).await, b"streaming");

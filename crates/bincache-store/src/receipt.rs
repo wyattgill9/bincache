@@ -96,11 +96,10 @@ impl Store {
         Ok(Self { dir })
     }
 
-    pub async fn read(
-        &self,
-        nar_hash: &bincache_core::hash::Sha256,
-    ) -> Result<Option<Receipt>, Error> {
-        let Some(raw) = self.dir.read(&nar_hash.base32()).await.context(DirSnafu)? else {
+    /// Synchronous: see [`crate::atomic::Dir::read`] for why the hot metadata path does
+    /// not go through a blocking threadpool.
+    pub fn read(&self, nar_hash: &bincache_core::hash::Sha256) -> Result<Option<Receipt>, Error> {
+        let Some(raw) = self.dir.read(&nar_hash.base32()).context(DirSnafu)? else {
             return Ok(None);
         };
         let text = core::str::from_utf8(&raw).context(EncodingSnafu)?;
@@ -212,14 +211,14 @@ mod tests {
         let store = crate::receipt::Store::open(&root).await.expect("opens");
         let nar_hash = bincache_core::hash::Sha256::digest(b"uncompressed");
 
-        assert_eq!(store.read(&nar_hash).await.expect("reads"), None);
+        assert_eq!(store.read(&nar_hash).expect("reads"), None);
         store.write(&nar_hash, &sample()).await.expect("writes");
-        assert_eq!(store.read(&nar_hash).await.expect("reads"), Some(sample()));
+        assert_eq!(store.read(&nar_hash).expect("reads"), Some(sample()));
 
         assert_eq!(
             store.remove(&nar_hash).await.expect("removes"),
             crate::atomic::Removed::Deleted
         );
-        assert_eq!(store.read(&nar_hash).await.expect("reads"), None);
+        assert_eq!(store.read(&nar_hash).expect("reads"), None);
     }
 }

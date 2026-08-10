@@ -147,7 +147,6 @@ impl Ingest {
         let receipt = self
             .receipt
             .read(&declared.nar_hash)
-            .await
             .context(ReceiptSnafu)?
             .context(UnknownNarSnafu { nar_hash: declared.nar_hash })?;
 
@@ -343,11 +342,11 @@ mod tests {
             crate::maintain::delete(narinfo, receipts, dir, &key).await.expect("deletes"),
             crate::maintain::Deleted::Removed
         );
-        assert!(narinfo.read(&key).await.expect("reads").is_none());
-        assert!(receipts.read(&record.nar_hash).await.expect("reads").is_none());
+        assert!(narinfo.read(&key).expect("reads").is_none());
+        assert!(receipts.read(&record.nar_hash).expect("reads").is_none());
 
         // The artifact stays. Whether anything still needs it is reconcile's question.
-        assert!(ingest.store().read(&record.nar()).await.expect("reads").is_some());
+        assert!(ingest.store().read(&record.nar()).expect("reads").is_some());
         assert_eq!(
             crate::maintain::delete(narinfo, receipts, dir, &key).await.expect("deletes"),
             crate::maintain::Deleted::Absent
@@ -377,12 +376,11 @@ mod tests {
         let survivor = ingest
             .narinfo()
             .read(second.store_path.hash())
-            .await
             .expect("reads")
             .expect("the sibling is still published");
         assert!(!survivor.is_empty());
         assert!(
-            ingest.store().read(&second.nar()).await.expect("reads").is_some(),
+            ingest.store().read(&second.nar()).expect("reads").is_some(),
             "the sibling's artifact must survive the other path's delete"
         );
     }
@@ -449,7 +447,6 @@ mod tests {
         let published = ingest
             .narinfo()
             .read(bincache_core::storepath::Path::parse(PATH).expect("parses").hash())
-            .await
             .expect("reads")
             .expect("present");
         let body = String::from_utf8(published).expect("utf8");

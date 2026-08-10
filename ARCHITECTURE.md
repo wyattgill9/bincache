@@ -12,7 +12,7 @@ socket and asserts that; `scripts/conformance.py` does the same against a runnin
 including verifying the ed25519 signature the way a client verifies it.
 
 Deferred on purpose, with the reasoning in `research/DESIGN_V2.md`: the RAM projection in
-front of `redb`, TLS, HTTP/2, garbage collection, and the negative-lookup filter tier.
+front of `lkv`, TLS, HTTP/2, garbage collection, and the negative-lookup filter tier.
 
 ## The one sentence
 
@@ -47,7 +47,8 @@ Crates split by who owns what, not by feature.
   fingerprint, ed25519 keys and signatures, and `narurl` as the single owner of the
   `nar/<file hash>.nar<ext>` convention in both directions. No I/O, no async, no sibling
   deps.
-- **`bincache-index`** is the `redb` schema. Two tables, `rkyv`-encoded values.
+- **`bincache-index`** is the `lkv` schema. Two tag-separated keyspaces, `rkyv`-encoded
+  values.
 - **`bincache-store`** is the filesystem: content-addressed artifacts, atomic appearance,
   reader handles, and the scan that finds orphans.
 - **`bincache-ingest`** is the only writer. The typestate upload machine, the publish, push
@@ -71,7 +72,7 @@ core  <-  index  <-  ingest  <-  serve  <-  bincache
 1. `serve` reads the socket into the connection's buffer and parses HTTP/1.1 by hand.
 2. `route` decodes the 32-character base32 key into `core::storepath::Hash`. Malformed
    input dies here with a 400, before touching any data structure.
-3. `index` reads the record out of `redb`.
+3. `index` reads the record out of `lkv`.
 4. `core` renders the body from the record's fields.
 5. `serve` builds the framing and writes head and body in one buffer.
 
@@ -117,9 +118,9 @@ A pre-compressed upload is refused with a message naming the setting.
 
 ### Boot
 
-Open the payload directory and the `redb` file, sweep staging files a crash may have left,
+Open the payload directory and the `lkv` file, sweep staging files a crash may have left,
 start the watchdog, start the shards. There is no snapshot to validate and no log to
-replay: a `redb` commit is the publish.
+replay: an `lkv` commit is the publish.
 
 ## The two connectors
 

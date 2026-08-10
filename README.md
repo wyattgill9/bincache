@@ -89,7 +89,7 @@ Two things that will otherwise cost you an afternoon:
 `GET /metrics` serves Prometheus text: request counts, metadata hits and misses, bytes
 served, uploads, rejections, and paths held.
 
-These need the server stopped, because `redb` allows one writer process:
+These need the server stopped, because `lkv` allows one writer process:
 
 ```sh
 bincache reconcile --data-dir /var/lib/bincache   # payload tree against index, both ways
@@ -156,7 +156,7 @@ test using one passes even when the signature is wrong.
 ```
 crates/
   bincache-core/     types, base32, narinfo render and parse, fingerprint, signing
-  bincache-index/    redb schema, rkyv records
+  bincache-index/    lkv schema, rkyv records
   bincache-store/    content-addressed NAR files, atomic placement, orphan scan
   bincache-ingest/   upload state machine, publish, auth, maintenance
   bincache-serve/    shards, HTTP/1.1, routing, ranges, counters

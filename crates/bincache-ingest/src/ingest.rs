@@ -173,7 +173,7 @@ mod tests {
     async fn ingest(name: &str) -> crate::ingest::Ingest {
         let root = root(name);
         let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
-        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
+        let index = bincache_index::index::Index::open(root.join("index.lkv")).expect("opens");
         crate::ingest::Ingest::new(crate::ingest::Parts {
             store,
             index,

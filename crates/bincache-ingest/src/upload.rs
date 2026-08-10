@@ -241,7 +241,7 @@ mod tests {
     async fn harness(name: &str) -> Harness {
         let root = root(name);
         let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
-        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
+        let index = bincache_index::index::Index::open(root.join("index.lkv")).expect("opens");
         Harness { store, index }
     }
 

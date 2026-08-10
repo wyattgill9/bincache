@@ -13,8 +13,8 @@ bincache-store  = { workspace = true }
 
 clap               = { workspace = true }
 compio             = { workspace = true, features = ["runtime"] }
+lkv                = { workspace = true }
 mimalloc           = { workspace = true }
-redb               = { workspace = true }
 snafu              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -7,7 +7,7 @@ publish.workspace = true
 [dependencies]
 bincache-core = { workspace = true }
 
-redb    = { workspace = true }
+lkv     = { workspace = true }
 rkyv    = { workspace = true }
 snafu   = { workspace = true }
 tracing = { workspace = true }

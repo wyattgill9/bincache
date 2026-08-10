@@ -62,7 +62,7 @@ impl Server {
         }
 
         let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
-        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
+        let index = bincache_index::index::Index::open(root.join("index.lkv")).expect("opens");
         let secret = bincache_core::sign::SecretKey::generate("bincache-test-1".to_owned());
         let dir =
             bincache_core::storepath::Dir::new(bincache_core::storepath::DIR_DEFAULT.to_owned())

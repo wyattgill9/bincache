@@ -2,7 +2,7 @@
 //! and hand them to the shards.
 //!
 //! Boot is deliberately short. There is no snapshot to validate, no log to replay, and no
-//! O(n) filesystem rescan, because `redb` owns crash consistency and a commit is the
+//! O(n) filesystem rescan, because `lkv` owns crash consistency and a commit is the
 //! publish. What is left is sweeping staging files a crash may have left behind.
 
 use snafu::OptionExt as _;
@@ -12,7 +12,7 @@ use snafu::ResultExt as _;
 const PAYLOAD: &str = "payload";
 
 /// The index database file, under the data directory.
-const INDEX: &str = "index.redb";
+const INDEX: &str = "index.lkv";
 
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
@@ -49,7 +49,7 @@ pub enum Error {
     Index { source: bincache_index::index::Error },
 
     #[snafu(display(
-        "the index at {} is held by another process. redb allows one writer process at a \
+        "the index at {} is held by another process. lkv allows one writer process at a \
          time, so maintenance subcommands need the server stopped.",
         path.display()
     ))]
@@ -216,7 +216,7 @@ fn open(storage: &crate::args::Storage) -> Result<Artifacts, Error> {
     let path = storage.data_dir.join(INDEX);
     let opened = bincache_index::index::Index::open(path.clone());
     if let Err(bincache_index::index::Error::Open {
-        source: redb::DatabaseError::DatabaseAlreadyOpen,
+        source: lkv::Error::DatabaseAlreadyOpen(_),
         ..
     }) = &opened
     {

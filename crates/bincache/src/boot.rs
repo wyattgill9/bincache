@@ -1,18 +1,13 @@
-//! The composition root: open the two durable artifacts, build the shared handles once,
-//! and hand them to the server.
+//! The composition root: open the data directory, build the shared handles once, and hand
+//! them to the server.
 //!
-//! Boot is deliberately short. There is no snapshot to validate, no log to replay, and no
-//! O(n) filesystem rescan, because `redb` owns crash consistency and a commit is the
-//! publish. What is left is sweeping staging files a crash may have left behind.
+//! Boot is deliberately short. There is no snapshot to validate and no log to replay,
+//! because a rename is the publish. What is left is sweeping the temporary files a crash
+//! may have left behind, and counting what is published so `/metrics` has a starting
+//! point.
 
 use snafu::OptionExt as _;
 use snafu::ResultExt as _;
-
-/// Subdirectory of the data directory holding the NAR tree.
-const PAYLOAD: &str = "payload";
-
-/// The index database file, under the data directory.
-const INDEX: &str = "index.redb";
 
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
@@ -42,15 +37,14 @@ pub enum Error {
     #[snafu(display("the payload directory could not be opened"))]
     Store { source: bincache_store::nar::Error },
 
-    #[snafu(display("the index could not be opened"))]
-    Index { source: bincache_index::index::Error },
+    #[snafu(display("the narinfo directory could not be opened"))]
+    Narinfo { source: bincache_store::narinfo::Error },
 
-    #[snafu(display(
-        "the index at {} is held by another process. redb allows one writer process at a \
-         time, so maintenance subcommands need the server stopped.",
-        path.display()
-    ))]
-    IndexLocked { path: std::path::PathBuf },
+    #[snafu(display("the receipt directory could not be opened"))]
+    Receipt { source: bincache_store::receipt::Error },
+
+    #[snafu(display("the write path could not be assembled"))]
+    Ingest { source: bincache_ingest::ingest::Error },
 
     #[snafu(display("a maintenance operation failed"))]
     Maintain { source: bincache_ingest::maintain::Error },
@@ -84,29 +78,33 @@ async fn serve(args: crate::args::Serve) -> Result<(), Error> {
         .context(ZstdLevelSnafu { level: args.zstd_level })?;
 
     let artifacts = open(&args.storage).await?;
-    let swept = artifacts.store.sweep_staging().await.context(StoreSnafu)?;
+    let swept = artifacts.store.sweep_staging().await.context(StoreSnafu)?
+        + artifacts.narinfo.sweep().await.context(NarinfoSnafu)?
+        + artifacts.receipt.sweep().await.context(ReceiptSnafu)?;
     if swept > 0 {
-        tracing::warn!(swept, "removed staging files a previous run left behind");
+        tracing::warn!(swept, "removed partial files a previous run left behind");
     }
 
     let tokens = push_tokens(&args)?;
     if tokens.is_empty() {
         tracing::warn!("no push tokens configured; the cache is read-only");
     }
+    let ingest = bincache_ingest::ingest::Ingest::new(bincache_ingest::ingest::Parts {
+        store: artifacts.store,
+        narinfo: artifacts.narinfo,
+        receipt: artifacts.receipt,
+        key: key.clone(),
+        dir: store_dir.clone(),
+        level,
+    })
+    .context(IngestSnafu)?;
+
     tracing::info!(
-        paths = artifacts.index.count().context(IndexSnafu)?,
+        paths = ingest.paths(),
         %store_dir,
         public_key = %key.public().render(),
         "bincache starting"
     );
-
-    let ingest = bincache_ingest::ingest::Ingest::new(bincache_ingest::ingest::Parts {
-        store: artifacts.store,
-        index: artifacts.index,
-        key,
-        dir: store_dir.clone(),
-        level,
-    });
 
     let cache = bincache_serve::handler::Cache::new(bincache_serve::handler::Parts {
         ingest,
@@ -144,17 +142,27 @@ async fn delete(args: crate::args::Delete) -> Result<(), Error> {
         .context(PathSnafu { path: args.path.clone() })?;
 
     let artifacts = open(&args.storage).await?;
-    let deleted = bincache_ingest::maintain::delete(&artifacts.store, &artifacts.index, &key)
-        .await
-        .context(MaintainSnafu)?;
+    let deleted = bincache_ingest::maintain::delete(
+        &artifacts.narinfo,
+        &artifacts.receipt,
+        &dir(&args.store)?,
+        &key,
+    )
+    .await
+    .context(MaintainSnafu)?;
     println!("{key}: {deleted:?}");
     Ok(())
 }
 
-async fn reconcile(storage: crate::args::Storage) -> Result<(), Error> {
-    let artifacts = open(&storage).await?;
-    let found = bincache_ingest::maintain::reconcile(&artifacts.store, &artifacts.index)
-        .context(MaintainSnafu)?;
+async fn reconcile(args: crate::args::Reconcile) -> Result<(), Error> {
+    let artifacts = open(&args.storage).await?;
+    let found = bincache_ingest::maintain::reconcile(
+        &artifacts.store,
+        &artifacts.narinfo,
+        &dir(&args.store)?,
+    )
+    .await
+    .context(MaintainSnafu)?;
     println!("orphan artifacts: {}", found.orphan_artifacts.len());
     for url in &found.orphan_artifacts {
         println!("  {}", url.name());
@@ -173,32 +181,30 @@ async fn reconcile(storage: crate::args::Storage) -> Result<(), Error> {
 async fn rotate(args: crate::args::Rotate) -> Result<(), Error> {
     let key = secret_key(&args.secret_key_file)?;
     let artifacts = open(&args.storage).await?;
-    let rotated = bincache_ingest::maintain::rotate(&artifacts.index, &dir(&args.store)?, &key)
+    let rotated = bincache_ingest::maintain::rotate(&artifacts.narinfo, &dir(&args.store)?, &key)
+        .await
         .context(MaintainSnafu)?;
     println!("re-signed {rotated} records under {}", key.public().render());
     Ok(())
 }
 
-/// The two durable artifacts, opened together because nothing uses one without the other.
+/// The three directories, opened together because nothing uses one without the others.
+///
+/// No lock file and no single-writer database, so `reconcile`, `delete`, and `rotate` no
+/// longer need the server stopped. Each writes with an atomic rename that a concurrent
+/// reader either sees whole or does not see.
 struct Artifacts {
     store: bincache_store::nar::Store,
-    index: bincache_index::index::Index,
+    narinfo: bincache_store::narinfo::Store,
+    receipt: bincache_store::receipt::Store,
 }
 
 async fn open(storage: &crate::args::Storage) -> Result<Artifacts, Error> {
-    let store = bincache_store::nar::Store::open(storage.data_dir.join(PAYLOAD))
-        .await
-        .context(StoreSnafu)?;
-    let path = storage.data_dir.join(INDEX);
-    let opened = bincache_index::index::Index::open(path.clone());
-    if let Err(bincache_index::index::Error::Open {
-        source: redb::DatabaseError::DatabaseAlreadyOpen,
-        ..
-    }) = &opened
-    {
-        return IndexLockedSnafu { path }.fail();
-    }
-    Ok(Artifacts { store, index: opened.context(IndexSnafu)? })
+    let root = &storage.data_dir;
+    let store = bincache_store::nar::Store::open(root.clone()).await.context(StoreSnafu)?;
+    let narinfo = bincache_store::narinfo::Store::open(root).await.context(NarinfoSnafu)?;
+    let receipt = bincache_store::receipt::Store::open(root).await.context(ReceiptSnafu)?;
+    Ok(Artifacts { store, narinfo, receipt })
 }
 
 fn dir(store: &crate::args::Store) -> Result<bincache_core::storepath::Dir, Error> {

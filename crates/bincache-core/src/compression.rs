@@ -15,9 +15,6 @@
     strum::Display,
     strum::EnumString,
     strum::VariantArray,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
 )]
 #[strum(serialize_all = "lowercase")]
 pub enum Compression {
@@ -27,6 +24,13 @@ pub enum Compression {
     Bzip2,
     Br,
 }
+
+/// What bincache writes to disk, regardless of what a client could produce.
+///
+/// The client floor is Nix 2.4, which is where zstd support landed. Named here rather than
+/// at the ingest that applies it, because the store, the receipt, and the served URL all
+/// have to agree with it.
+pub const STORED: Compression = Compression::Zstd;
 
 impl Compression {
     /// The suffix `nix/src/libstore/binary-cache-store.cc` appends to a NAR URL for this

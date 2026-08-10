@@ -22,11 +22,6 @@ use std::io::Write as _;
 /// artifact.
 const DRAIN_THRESHOLD: usize = 256 * 1024;
 
-/// Everything bincache stores is zstd, per the client floor of Nix 2.4 declared in
-/// `research/DESIGN_V2.md`.
-pub const STORED_AS: bincache_core::compression::Compression =
-    bincache_core::compression::Compression::Zstd;
-
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
@@ -43,7 +38,7 @@ pub enum Error {
     Empty,
 
     #[snafu(display("recording the stored artifact failed"))]
-    Record { source: bincache_index::index::Error },
+    Record { source: bincache_store::receipt::Error },
 }
 
 impl Error {
@@ -192,21 +187,23 @@ impl Upload<Verified> {
     /// `fsync`, rename into the content-addressed name, then record where the NAR landed.
     ///
     /// The order matters: a crash between the two leaves an orphan artifact that
-    /// reconciliation collects, never a record pointing at bytes that are not there.
+    /// reconciliation reports, never a receipt pointing at bytes that are not there.
     pub async fn store(
         self,
         store: &bincache_store::nar::Store,
-        index: &bincache_index::index::Index,
-    ) -> Result<bincache_index::nar::Entry, Error> {
+        receipts: &bincache_store::receipt::Store,
+    ) -> Result<bincache_store::receipt::Receipt, Error> {
         let Verified { nar_hash, nar_size, file_hash, file_size } = self.state;
-        let url = bincache_core::narurl::NarUrl { file_hash, compression: STORED_AS };
+        let url = bincache_core::narurl::NarUrl {
+            file_hash,
+            compression: bincache_core::compression::STORED,
+        };
 
         self.staged.commit(store, &url).await.context(StageSnafu)?;
 
-        let entry =
-            bincache_index::nar::Entry { file_hash, file_size, nar_size, compression: STORED_AS };
-        index.put_nar(&nar_hash, &entry).context(RecordSnafu)?;
-        Ok(entry)
+        let receipt = bincache_store::receipt::Receipt { file_hash, file_size, nar_size };
+        receipts.write(&nar_hash, &receipt).await.context(RecordSnafu)?;
+        Ok(receipt)
     }
 }
 
@@ -235,14 +232,14 @@ mod tests {
 
     struct Harness {
         store: bincache_store::nar::Store,
-        index: bincache_index::index::Index,
+        receipts: bincache_store::receipt::Store,
     }
 
     async fn harness(name: &str) -> Harness {
         let root = root(name);
-        let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
-        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
-        Harness { store, index }
+        let store = bincache_store::nar::Store::open(root.clone()).await.expect("opens");
+        let receipts = bincache_store::receipt::Store::open(&root).await.expect("opens");
+        Harness { store, receipts }
     }
 
     fn level() -> crate::upload::Level {
@@ -272,13 +269,13 @@ mod tests {
             .await
             .verify()
             .expect("verifies")
-            .store(&harness.store, &harness.index)
+            .store(&harness.store, &harness.receipts)
             .await
             .expect("stores");
 
         assert_eq!(entry.nar_size.get(), u64::try_from(body.len()).expect("fits"));
-        assert_eq!(entry.compression, crate::upload::STORED_AS);
-        assert_eq!(harness.index.nar(&nar_hash).expect("reads"), Some(entry));
+
+        assert_eq!(harness.receipts.read(&nar_hash).await.expect("reads"), Some(entry));
 
         let reader = harness.store.read(&entry.url()).await.expect("reads").expect("present");
         assert_eq!(reader.size(), entry.file_size);
@@ -296,7 +293,7 @@ mod tests {
             .await
             .verify()
             .expect("verifies")
-            .store(&harness.store, &harness.index)
+            .store(&harness.store, &harness.receipts)
             .await
             .expect("stores");
 
@@ -319,7 +316,7 @@ mod tests {
         assert!(matches!(refused, Err(crate::upload::Error::HashMismatch { .. })));
 
         assert_eq!(harness.store.scan().expect("scans").artifacts.len(), 0);
-        assert!(harness.index.nar(&declared).expect("reads").is_none());
+        assert!(harness.receipts.read(&declared).await.expect("reads").is_none());
     }
 
     #[tokio::test]
@@ -364,7 +361,7 @@ mod tests {
                 .await
                 .verify()
                 .expect("verifies")
-                .store(&harness.store, &harness.index)
+                .store(&harness.store, &harness.receipts)
                 .await
                 .expect("stores");
             entries.push(entry);

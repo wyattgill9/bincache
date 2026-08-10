@@ -58,8 +58,9 @@ impl Server {
             assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "stale root not removable");
         }
 
-        let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
-        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
+        let store = bincache_store::nar::Store::open(root.clone()).await.expect("opens");
+        let narinfo = bincache_store::narinfo::Store::open(&root).await.expect("opens");
+        let receipt = bincache_store::receipt::Store::open(&root).await.expect("opens");
         let secret = bincache_core::sign::SecretKey::generate("bincache-test-1".to_owned());
         let dir =
             bincache_core::storepath::Dir::new(bincache_core::storepath::DIR_DEFAULT.to_owned())
@@ -67,11 +68,13 @@ impl Server {
 
         let ingest = bincache_ingest::ingest::Ingest::new(bincache_ingest::ingest::Parts {
             store,
-            index,
+            narinfo,
+            receipt,
             key: secret.clone(),
             dir: dir.clone(),
             level: bincache_ingest::upload::Level::new(3).expect("in range"),
-        });
+        })
+        .expect("counts what is published");
 
         let token = bincache_ingest::auth::generate();
         let cache = bincache_serve::handler::Cache::new(bincache_serve::handler::Parts {

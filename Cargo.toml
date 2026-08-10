@@ -21,11 +21,6 @@ expect-test     = { version = "1.5" }
 # axum and tower; named here so the use is declared rather than incidental.
 futures-util    = { version = "0.3", default-features = false }
 rand            = { version = "0.9" }
-redb            = { version = "4.1" }
-# `unaligned` so an archive can be validated straight out of a `redb` value, which hands
-# back a byte slice at whatever alignment its page put it. `little_endian` so the on-disk
-# format does not change meaning on a big-endian or differently-tuned build.
-rkyv            = { version = "0.8", features = ["unaligned", "little_endian"] }
 sha2            = { version = "0.11" }
 snafu           = { version = "0.9" }
 strum           = { version = "0.28", features = ["derive"] }
@@ -41,7 +36,6 @@ zstd            = { version = "0.13" }
 pretty_assertions = { version = "1.4" }
 
 bincache-core   = { path = "crates/bincache-core" }
-bincache-index  = { path = "crates/bincache-index" }
 bincache-ingest = { path = "crates/bincache-ingest" }
 bincache-serve  = { path = "crates/bincache-serve" }
 bincache-store  = { path = "crates/bincache-store" }

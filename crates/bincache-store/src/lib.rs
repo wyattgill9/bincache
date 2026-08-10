@@ -1,7 +1,10 @@
-//! The filesystem as the payload database.
+//! The data directory: artifacts, published narinfo bodies, and NAR receipts.
 //!
-//! NAR artifacts are immutable files at content-addressed names, so the page cache is the
-//! payload cache and recovery only ever has to answer "present or absent", never "which
-//! version". See `research/DESIGN_V2.md`, "The payload plane".
+//! Everything durable lives here and nothing else owns any of it. A publish is a rename, so
+//! there is no snapshot to validate at boot, no log to replay, and no second commit to keep
+//! in step with the first.
 
+pub mod atomic;
 pub mod nar;
+pub mod narinfo;
+pub mod receipt;

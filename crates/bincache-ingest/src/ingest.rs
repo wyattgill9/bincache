@@ -1,5 +1,5 @@
-//! The write-side composition object: store, index, signing key, and store directory,
-//! built once and threaded.
+//! The write-side composition object: the three data directories, the signing key, and the
+//! store directory, built once and threaded.
 //!
 //! It owns the two write operations a client performs and the two an operator performs.
 
@@ -29,13 +29,11 @@ pub enum Error {
     ))]
     UnknownNar { nar_hash: bincache_core::hash::Sha256 },
 
-    #[snafu(display(
-        "the narinfo declares NarSize {declared} but the uploaded NAR is {received} bytes"
-    ))]
-    NarSizeMismatch { declared: u64, received: u64 },
+    #[snafu(display("the NAR receipt could not be read"))]
+    Receipt { source: bincache_store::receipt::Error },
 
-    #[snafu(display("the index rejected the write"))]
-    Index { source: bincache_index::index::Error },
+    #[snafu(display("the narinfo could not be published"))]
+    Publish { source: bincache_store::narinfo::Error },
 }
 
 impl Error {
@@ -44,11 +42,12 @@ impl Error {
     #[must_use]
     pub const fn fault(&self) -> crate::fault::Fault {
         match self {
-            Self::PreCompressed { .. }
-            | Self::Narinfo { .. }
-            | Self::UnknownNar { .. }
-            | Self::NarSizeMismatch { .. } => crate::fault::Fault::Client,
-            Self::Stage { .. } | Self::Index { .. } => crate::fault::Fault::Server,
+            Self::PreCompressed { .. } | Self::Narinfo { .. } | Self::UnknownNar { .. } => {
+                crate::fault::Fault::Client
+            }
+            Self::Stage { .. } | Self::Receipt { .. } | Self::Publish { .. } => {
+                crate::fault::Fault::Server
+            }
             Self::Upload { source } => source.fault(),
         }
     }
@@ -58,32 +57,52 @@ impl Error {
 /// positional arguments, so a call site cannot transpose two of them.
 pub struct Parts {
     pub store: bincache_store::nar::Store,
-    pub index: bincache_index::index::Index,
+    pub narinfo: bincache_store::narinfo::Store,
+    pub receipt: bincache_store::receipt::Store,
     pub key: bincache_core::sign::SecretKey,
     pub dir: bincache_core::storepath::Dir,
     pub level: crate::upload::Level,
 }
 
-/// Cheap to clone. Built at the composition root and shared by every shard.
+/// Cheap to clone. Built at the composition root and shared by every request.
 #[derive(Clone)]
 pub struct Ingest {
     store: bincache_store::nar::Store,
-    index: bincache_index::index::Index,
+    narinfo: bincache_store::narinfo::Store,
+    receipt: bincache_store::receipt::Store,
     key: bincache_core::sign::SecretKey,
     dir: bincache_core::storepath::Dir,
     level: crate::upload::Level,
+    /// How many paths are published, seeded by one directory walk at construction.
+    ///
+    /// ponytail: an out-of-band `bincache delete` while the server runs makes this stale
+    /// until the next restart. Recounting per scrape would be a directory walk on a
+    /// million files; a gauge that is right at boot and right for every publish is worth
+    /// more than one that is exact and slow.
+    paths: std::sync::Arc<core::sync::atomic::AtomicU64>,
 }
 
 impl Ingest {
-    #[must_use]
-    pub fn new(parts: Parts) -> Self {
-        let Parts { store, index, key, dir, level } = parts;
-        Self { store, index, key, dir, level }
+    pub fn new(parts: Parts) -> Result<Self, Error> {
+        let Parts { store, narinfo, receipt, key, dir, level } = parts;
+        let counted = narinfo.count().context(PublishSnafu)?;
+        let paths = std::sync::Arc::new(core::sync::atomic::AtomicU64::new(counted));
+        Ok(Self { store, narinfo, receipt, key, dir, level, paths })
     }
 
     #[must_use]
-    pub const fn index(&self) -> &bincache_index::index::Index {
-        &self.index
+    pub const fn narinfo(&self) -> &bincache_store::narinfo::Store {
+        &self.narinfo
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &bincache_store::receipt::Store {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn paths(&self) -> u64 {
+        self.paths.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     #[must_use]
@@ -118,30 +137,27 @@ impl Ingest {
     /// Every field describing the payload is taken from what was actually received, not
     /// from what the body claims, and the client's own `Sig` lines are discarded: the key
     /// lives only here, so a compromised build node can poison only what it uploads.
-    pub fn publish(&self, body: &str) -> Result<bincache_core::narinfo::NarInfo, Error> {
+    /// `NarSize` comes from the receipt rather than from the body, like every other field
+    /// describing the payload. A client that declares a different one is not refused: the
+    /// hash it declared already determines the content, which determines the size, so the
+    /// received value is authoritative and the declared one is noise.
+    pub async fn publish(&self, body: &str) -> Result<bincache_core::narinfo::NarInfo, Error> {
         let declared =
             bincache_core::narinfo::parse::parse(body, &self.dir).context(NarinfoSnafu)?;
-        let entry = self
-            .index
-            .nar(&declared.nar_hash)
-            .context(IndexSnafu)?
+        let receipt = self
+            .receipt
+            .read(&declared.nar_hash)
+            .await
+            .context(ReceiptSnafu)?
             .context(UnknownNarSnafu { nar_hash: declared.nar_hash })?;
-
-        snafu::ensure!(
-            entry.nar_size == declared.nar_size,
-            NarSizeMismatchSnafu {
-                declared: declared.nar_size.get(),
-                received: entry.nar_size.get(),
-            }
-        );
 
         let mut record = bincache_core::narinfo::NarInfo {
             store_path: declared.store_path,
-            compression: entry.compression,
-            file_hash: entry.file_hash,
-            file_size: entry.file_size,
+            compression: bincache_core::compression::STORED,
+            file_hash: receipt.file_hash,
+            file_size: receipt.file_size,
             nar_hash: declared.nar_hash,
-            nar_size: declared.nar_size,
+            nar_size: receipt.nar_size,
             references: declared.references,
             deriver: declared.deriver,
             sigs: Vec::new(),
@@ -149,7 +165,14 @@ impl Ingest {
         };
         record.resign(&self.dir, &self.key);
 
-        self.index.publish(&record).context(IndexSnafu)?;
+        let wrote = self
+            .narinfo
+            .write(record.store_path.hash(), &record.render(&self.dir))
+            .await
+            .context(PublishSnafu)?;
+        if wrote == bincache_store::atomic::Wrote::Created {
+            self.paths.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
         tracing::info!(path = %record.store_path, "published");
         Ok(record)
     }
@@ -172,11 +195,13 @@ mod tests {
 
     async fn ingest(name: &str) -> crate::ingest::Ingest {
         let root = root(name);
-        let store = bincache_store::nar::Store::open(root.join("payload")).await.expect("opens");
-        let index = bincache_index::index::Index::open(root.join("index.redb")).expect("opens");
+        let store = bincache_store::nar::Store::open(root.clone()).await.expect("opens");
+        let narinfo = bincache_store::narinfo::Store::open(&root).await.expect("opens");
+        let receipt = bincache_store::receipt::Store::open(&root).await.expect("opens");
         crate::ingest::Ingest::new(crate::ingest::Parts {
             store,
-            index,
+            narinfo,
+            receipt,
             key: bincache_core::sign::SecretKey::generate("bincache-test-1".to_owned()),
             dir: bincache_core::storepath::Dir::new(
                 bincache_core::storepath::DIR_DEFAULT.to_owned(),
@@ -184,9 +209,14 @@ mod tests {
             .expect("absolute"),
             level: crate::upload::Level::new(3).expect("in range"),
         })
+        .expect("counts what is published")
     }
 
     const PATH: &str = "5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j-hello-2.12.1";
+
+    /// A second store path with different contents in its *name* only. A NAR does not
+    /// include the name, so both paths hash to the same NAR and share one artifact.
+    const SIBLING: &str = "9xkzq1n7hdmvbdzq0d5m5xrz3xz6ky8j-hello-2.12.1";
 
     /// What `nix copy --to 'http://host?compression=none'` renders and uploads.
     fn client_narinfo(body: &[u8]) -> String {
@@ -208,7 +238,10 @@ mod tests {
         )
     }
 
-    async fn upload(ingest: &crate::ingest::Ingest, body: &[u8]) -> bincache_index::nar::Entry {
+    async fn upload(
+        ingest: &crate::ingest::Ingest,
+        body: &[u8],
+    ) -> bincache_store::receipt::Receipt {
         let target = bincache_core::narurl::NarUrl {
             file_hash: bincache_core::hash::Sha256::digest(body),
             compression: bincache_core::compression::Compression::None,
@@ -221,7 +254,7 @@ mod tests {
             .expect("finishes")
             .verify()
             .expect("verifies")
-            .store(ingest.store(), ingest.index())
+            .store(ingest.store(), ingest.receipt())
             .await
             .expect("stores")
     }
@@ -232,7 +265,7 @@ mod tests {
         let body = b"nix-archive-1 body".repeat(40);
         let entry = upload(&ingest, &body).await;
 
-        let record = ingest.publish(&client_narinfo(&body)).expect("publishes");
+        let record = ingest.publish(&client_narinfo(&body)).await.expect("publishes");
         assert_eq!(record.compression, bincache_core::compression::Compression::Zstd);
         assert_eq!(record.file_hash, entry.file_hash);
         assert_eq!(record.file_size, entry.file_size);
@@ -249,7 +282,7 @@ mod tests {
         let body = b"nix-archive-1 signed".repeat(40);
         upload(&ingest, &body).await;
 
-        let record = ingest.publish(&client_narinfo(&body)).expect("publishes");
+        let record = ingest.publish(&client_narinfo(&body)).await.expect("publishes");
         assert_eq!(record.sigs.len(), 1);
         assert_eq!(record.sigs[0].name(), "bincache-test-1");
     }
@@ -259,13 +292,18 @@ mod tests {
         let ingest = ingest("orphan-narinfo").await;
         let body = b"never uploaded";
         assert!(matches!(
-            ingest.publish(&client_narinfo(body)),
+            ingest.publish(&client_narinfo(body)).await,
             Err(crate::ingest::Error::UnknownNar { .. })
         ));
     }
 
+    /// A client that declares the wrong `NarSize` is corrected, not refused.
+    ///
+    /// The `NarHash` it declared already determines the content, which determines the size,
+    /// so the received value is authoritative. Publishing the received one keeps the rule
+    /// that every field describing the payload comes from what arrived.
     #[tokio::test]
-    async fn refuses_a_narinfo_that_lies_about_the_nar_size() {
+    async fn a_narinfo_that_lies_about_the_nar_size_is_corrected() {
         let ingest = ingest("size-lie").await;
         let body = b"nix-archive-1 truthful".repeat(10);
         upload(&ingest, &body).await;
@@ -273,10 +311,8 @@ mod tests {
         let honest = client_narinfo(&body);
         let lying = honest
             .replace(&format!("NarSize: {}", body.len()), &format!("NarSize: {}", body.len() + 1));
-        assert!(matches!(
-            ingest.publish(&lying),
-            Err(crate::ingest::Error::NarSizeMismatch { .. })
-        ));
+        let record = ingest.publish(&lying).await.expect("publishes");
+        assert_eq!(record.nar_size.get(), u64::try_from(body.len()).expect("fits"));
     }
 
     #[tokio::test]
@@ -295,24 +331,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_both_the_record_and_the_artifact() {
+    async fn delete_forgets_the_record_and_leaves_the_artifact() {
         let ingest = ingest("delete").await;
         let body = b"nix-archive-1 deletable".repeat(10);
         upload(&ingest, &body).await;
-        let record = ingest.publish(&client_narinfo(&body)).expect("publishes");
+        let record = ingest.publish(&client_narinfo(&body)).await.expect("publishes");
 
         let key = *record.store_path.hash();
-        let store = ingest.store();
-        let index = ingest.index();
+        let (narinfo, receipts, dir) = (ingest.narinfo(), ingest.receipt(), ingest.dir());
         assert_eq!(
-            crate::maintain::delete(store, index, &key).await.expect("deletes"),
+            crate::maintain::delete(narinfo, receipts, dir, &key).await.expect("deletes"),
             crate::maintain::Deleted::Removed
         );
-        assert!(index.narinfo(&key).expect("reads").is_none());
-        assert!(store.read(&record.nar()).await.expect("reads").is_none());
+        assert!(narinfo.read(&key).await.expect("reads").is_none());
+        assert!(receipts.read(&record.nar_hash).await.expect("reads").is_none());
+
+        // The artifact stays. Whether anything still needs it is reconcile's question.
+        assert!(ingest.store().read(&record.nar()).await.expect("reads").is_some());
         assert_eq!(
-            crate::maintain::delete(store, index, &key).await.expect("deletes"),
+            crate::maintain::delete(narinfo, receipts, dir, &key).await.expect("deletes"),
             crate::maintain::Deleted::Absent
+        );
+    }
+
+    /// A NAR excludes the store path name, so two paths whose contents are identical share
+    /// one artifact. Deleting one must not strand the other.
+    #[tokio::test]
+    async fn deleting_one_path_leaves_a_sibling_that_shares_its_nar_servable() {
+        let ingest = ingest("shared-nar").await;
+        let body = b"nix-archive-1 shared".repeat(10);
+        upload(&ingest, &body).await;
+
+        // Two store paths, same contents, therefore the same NarHash and the same artifact.
+        let first = ingest.publish(&client_narinfo(&body)).await.expect("publishes");
+        let second_body = client_narinfo(&body).replace(PATH, SIBLING);
+        let second = ingest.publish(&second_body).await.expect("publishes");
+        assert_eq!(first.nar_hash, second.nar_hash);
+        assert_eq!(first.file_hash, second.file_hash);
+
+        let key = *first.store_path.hash();
+        crate::maintain::delete(ingest.narinfo(), ingest.receipt(), ingest.dir(), &key)
+            .await
+            .expect("deletes");
+
+        let survivor = ingest
+            .narinfo()
+            .read(second.store_path.hash())
+            .await
+            .expect("reads")
+            .expect("the sibling is still published");
+        assert!(!survivor.is_empty());
+        assert!(
+            ingest.store().read(&second.nar()).await.expect("reads").is_some(),
+            "the sibling's artifact must survive the other path's delete"
         );
     }
 
@@ -323,14 +394,43 @@ mod tests {
         upload(&ingest, &body).await;
 
         let reconciliation =
-            crate::maintain::reconcile(ingest.store(), ingest.index()).expect("reconciles");
+            crate::maintain::reconcile(ingest.store(), ingest.narinfo(), ingest.dir())
+                .await
+                .expect("reconciles");
         assert_eq!(reconciliation.orphan_artifacts.len(), 1);
         assert!(reconciliation.records_without_artifacts.is_empty());
 
-        ingest.publish(&client_narinfo(&body)).expect("publishes");
+        ingest.publish(&client_narinfo(&body)).await.expect("publishes");
         let reconciliation =
-            crate::maintain::reconcile(ingest.store(), ingest.index()).expect("reconciles");
+            crate::maintain::reconcile(ingest.store(), ingest.narinfo(), ingest.dir())
+                .await
+                .expect("reconciles");
         assert!(reconciliation.orphan_artifacts.is_empty());
+        assert!(reconciliation.records_without_artifacts.is_empty());
+    }
+
+    /// The artifact a delete leaves behind is exactly what reconcile is for.
+    #[tokio::test]
+    async fn reconcile_reports_what_a_delete_left_behind() {
+        let ingest = ingest("reconcile-after-delete").await;
+        let body = b"nix-archive-1 leftover".repeat(10);
+        upload(&ingest, &body).await;
+        let record = ingest.publish(&client_narinfo(&body)).await.expect("publishes");
+
+        crate::maintain::delete(
+            ingest.narinfo(),
+            ingest.receipt(),
+            ingest.dir(),
+            record.store_path.hash(),
+        )
+        .await
+        .expect("deletes");
+
+        let reconciliation =
+            crate::maintain::reconcile(ingest.store(), ingest.narinfo(), ingest.dir())
+                .await
+                .expect("reconciles");
+        assert_eq!(reconciliation.orphan_artifacts, vec![record.nar()]);
         assert!(reconciliation.records_without_artifacts.is_empty());
     }
 
@@ -339,17 +439,25 @@ mod tests {
         let ingest = ingest("rotate").await;
         let body = b"nix-archive-1 rotatable".repeat(10);
         upload(&ingest, &body).await;
-        ingest.publish(&client_narinfo(&body)).expect("publishes");
+        ingest.publish(&client_narinfo(&body)).await.expect("publishes");
 
         let key = bincache_core::sign::SecretKey::generate("bincache-test-2".to_owned());
-        let rotated = crate::maintain::rotate(ingest.index(), ingest.dir(), &key).expect("rotates");
+        let rotated =
+            crate::maintain::rotate(ingest.narinfo(), ingest.dir(), &key).await.expect("rotates");
         assert_eq!(rotated, 1);
-        for record in ingest.index().records().expect("lists") {
-            assert_eq!(record.sigs.len(), 1);
-            assert_eq!(record.sigs[0].name(), "bincache-test-2");
-            key.public()
-                .verify(&record.fingerprint(ingest.dir()), &record.sigs[0])
-                .expect("verifies under the new key");
-        }
+
+        let published = ingest
+            .narinfo()
+            .read(bincache_core::storepath::Path::parse(PATH).expect("parses").hash())
+            .await
+            .expect("reads")
+            .expect("present");
+        let body = String::from_utf8(published).expect("utf8");
+        let record = bincache_core::narinfo::parse::parse(&body, ingest.dir()).expect("parses");
+        assert_eq!(record.sigs.len(), 1);
+        assert_eq!(record.sigs[0].name(), "bincache-test-2");
+        key.public()
+            .verify(&record.fingerprint(ingest.dir()), &record.sigs[0])
+            .expect("verifies under the new key");
     }
 }

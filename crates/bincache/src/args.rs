@@ -21,12 +21,12 @@ pub enum Command {
     Keygen(Keygen),
     /// Generate a push token for one build node.
     Token,
-    /// Delete one path: its record, then its artifact. Needs the server stopped.
+    /// Delete one path. Its artifact stays for `reconcile` to report, because another path
+    /// may share it.
     Delete(Delete),
-    /// Compare the payload directory against the index, in both directions. Needs the
-    /// server stopped.
-    Reconcile(Storage),
-    /// Re-sign every record under the current key. Needs the server stopped.
+    /// Compare the payload directory against the published records, in both directions.
+    Reconcile(Reconcile),
+    /// Re-sign every record under the current key.
     Rotate(Rotate),
 }
 
@@ -99,9 +99,21 @@ pub struct Keygen {
 }
 
 #[derive(Debug, clap::Args)]
+pub struct Reconcile {
+    #[command(flatten)]
+    pub storage: Storage,
+
+    #[command(flatten)]
+    pub store: Store,
+}
+
+#[derive(Debug, clap::Args)]
 pub struct Delete {
     #[command(flatten)]
     pub storage: Storage,
+
+    #[command(flatten)]
+    pub store: Store,
 
     /// The 32-character store path hash, with or without the rest of the path.
     pub path: String,

@@ -6,7 +6,6 @@ publish.workspace = true
 
 [dependencies]
 bincache-core   = { workspace = true }
-bincache-index  = { workspace = true }
 bincache-ingest = { workspace = true }
 bincache-store  = { workspace = true }
 

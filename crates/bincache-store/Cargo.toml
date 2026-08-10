@@ -12,6 +12,7 @@ tokio   = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+expect-test       = { workspace = true }
 pretty_assertions = { workspace = true }
 
 [lints]

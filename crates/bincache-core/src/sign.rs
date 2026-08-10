@@ -16,7 +16,7 @@ pub const SIGNATURE_WIDTH: usize = 64;
 pub const KEY_WIDTH: usize = 32;
 
 /// One `Sig:` line: `<key-name>:<base64 ed25519 signature>`.
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature {
     name: String,
     bytes: [u8; SIGNATURE_WIDTH],

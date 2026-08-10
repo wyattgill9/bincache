@@ -15,7 +15,7 @@ pub const CONTENT_TYPE: &str = "text/x-nix-narinfo";
 /// Suffix of the metadata request key.
 pub const SUFFIX: &str = ".narinfo";
 
-#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NarInfo {
     pub store_path: crate::storepath::Path,
     pub compression: crate::compression::Compression,

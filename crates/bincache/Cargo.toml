@@ -6,13 +6,11 @@ publish.workspace = true
 
 [dependencies]
 bincache-core   = { workspace = true }
-bincache-index  = { workspace = true }
 bincache-ingest = { workspace = true }
 bincache-serve  = { workspace = true }
 bincache-store  = { workspace = true }
 
 clap               = { workspace = true }
-redb               = { workspace = true }
 snafu              = { workspace = true }
 tokio              = { workspace = true }
 tracing            = { workspace = true }

@@ -19,19 +19,7 @@ const HEX_LEN: usize = WIDTH * 2;
 /// Characters in the padded standard-base64 rendering.
 const BASE64_LEN: usize = 44;
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Sha256([u8; WIDTH]);
 
 #[derive(Debug, snafu::Snafu)]

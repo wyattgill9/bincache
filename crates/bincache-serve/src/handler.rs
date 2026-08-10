@@ -38,8 +38,11 @@ pub const METADATA_BODY_MAX: usize = 1024 * 1024;
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("the index could not be read"))]
-    Index { source: bincache_index::index::Error },
+    #[snafu(display("a published narinfo could not be read"))]
+    Narinfo { source: bincache_store::narinfo::Error },
+
+    #[snafu(display("a NAR receipt could not be read"))]
+    Receipt { source: bincache_store::receipt::Error },
 
     #[snafu(display("the payload store could not be read"))]
     Store { source: bincache_store::nar::Error },
@@ -181,8 +184,7 @@ fn cache_info(cache: &Cache) -> Result<axum::response::Response, Error> {
 }
 
 fn metrics(cache: &Cache) -> Result<axum::response::Response, Error> {
-    let paths = cache.ingest.index().count().context(IndexSnafu)?;
-    let rendered = cache.stats.total().render(paths);
+    let rendered = cache.stats.total().render(cache.ingest.paths());
     body(axum::http::StatusCode::OK, METRICS_TYPE, bytes::Bytes::from(rendered))
 }
 
@@ -199,17 +201,19 @@ async fn narinfo(
         return publish(cache, parts, request).await;
     }
 
-    let Some(record) = cache.ingest.index().narinfo(&key).context(IndexSnafu)? else {
+    let published = cache.ingest.narinfo().read(&key).await.context(NarinfoSnafu)?;
+    let Some(published) = published else {
         cache.stats.metadata_miss();
         return Ok(bare(axum::http::StatusCode::NOT_FOUND));
     };
     cache.stats.metadata_hit();
 
-    let rendered = record.render(cache.ingest.dir());
+    // The stored bytes are the served bytes. Nothing is decoded, re-rendered, or re-signed
+    // per request; the record was rendered once, at publish, from fields ingest verified.
     body(
         axum::http::StatusCode::OK,
         bincache_core::narinfo::CONTENT_TYPE,
-        bytes::Bytes::from(rendered),
+        bytes::Bytes::from(published),
     )
 }
 
@@ -239,10 +243,11 @@ async fn probe(
     let length = if url.compression == bincache_core::compression::Compression::None {
         cache
             .ingest
-            .index()
-            .nar(&url.file_hash)
-            .context(IndexSnafu)?
-            .map(|entry| entry.nar_size.get())
+            .receipt()
+            .read(&url.file_hash)
+            .await
+            .context(ReceiptSnafu)?
+            .map(|receipt| receipt.nar_size.get())
     } else {
         let reader = cache.ingest.store().read(url).await.context(StoreSnafu)?;
         reader.map(|reader| reader.size())
@@ -359,7 +364,7 @@ async fn receive(
             return Ok(Refusal::new(error.fault(), &error).into_response());
         }
     };
-    verified.store(cache.ingest.store(), cache.ingest.index()).await.context(UploadSnafu)?;
+    verified.store(cache.ingest.store(), cache.ingest.receipt()).await.context(UploadSnafu)?;
 
     cache.stats.upload();
     Ok(bare(axum::http::StatusCode::CREATED))
@@ -385,7 +390,7 @@ async fn publish(
         return Ok(bare(axum::http::StatusCode::BAD_REQUEST));
     };
 
-    if let Err(error) = cache.ingest.publish(&text) {
+    if let Err(error) = cache.ingest.publish(&text).await {
         tracing::warn!(error = ?error, "refused a narinfo");
         return Ok(Refusal::new(error.fault(), &error).into_response());
     }

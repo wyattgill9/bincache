@@ -186,8 +186,8 @@ impl Cache {
         self.send(exchange, head, body.as_bytes()).await
     }
 
-    /// `GET` and `HEAD` render the same body; `HEAD` reuses its length and writes no body,
-    /// which is the whole reason the stored artifact is a body rather than a framed
+    /// `GET` and `HEAD` answer with the same body; `HEAD` reuses its length and writes no
+    /// body, which is the whole reason the stored artifact is a body rather than a framed
     /// response.
     async fn narinfo(
         &self,
@@ -199,7 +199,8 @@ impl Cache {
         }
 
         let stats = self.stats.get(exchange.shard);
-        let Some(record) = self.ingest.index().narinfo(&key).context(IndexSnafu)? else {
+        let body = self.ingest.index().body(&key, self.ingest.dir()).context(IndexSnafu)?;
+        let Some(body) = body else {
             crate::stats::Shard::bump(&stats.metadata_misses, 1);
             return self
                 .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
@@ -207,13 +208,12 @@ impl Cache {
         };
         crate::stats::Shard::bump(&stats.metadata_hits, 1);
 
-        let body = record.render(self.ingest.dir());
         let mut head = crate::http::response::Head::new(
             crate::http::response::Status::Ok,
             exchange.request.keep_alive,
         );
         head.header("Content-Type", bincache_core::narinfo::CONTENT_TYPE);
-        self.send(exchange, head, body.as_bytes()).await
+        self.send(exchange, head, &body).await
     }
 
     async fn nar(

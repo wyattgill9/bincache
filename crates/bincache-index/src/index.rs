@@ -1,6 +1,6 @@
 //! The `redb` schema and the operations the rest of the system performs against it.
 //!
-//! Two tables, one writer discipline. A commit is the publish: there is no snapshot to
+//! Three tables, one writer discipline. A commit is the publish: there is no snapshot to
 //! validate at boot, no log to replay, and no O(n) filesystem rescan as the corruption
 //! floor, because the store owns crash consistency.
 //!
@@ -15,6 +15,16 @@ use snafu::ResultExt as _;
 /// `StorePathHash` to the signed narinfo record. The primary key of the whole protocol.
 const NARINFO: redb::TableDefinition<'static, &[u8; bincache_core::storepath::HASH_WIDTH], &[u8]> =
     redb::TableDefinition::new("narinfo");
+
+/// `StorePathHash` to the rendered narinfo body, which is what a `GET` writes to the socket.
+///
+/// A projection of [`NARINFO`], never a second source of truth: it carries no field the
+/// record does not already hold, it is written in the same commit that publishes the record,
+/// and [`Index::body`] renders from the record when it finds nothing here. That fallback is
+/// what keeps this a cache. An index written before the projection existed still answers
+/// correctly, and answers faster once its records are next written.
+const BODY: redb::TableDefinition<'static, &[u8; bincache_core::storepath::HASH_WIDTH], &[u8]> =
+    redb::TableDefinition::new("narinfo_body");
 
 /// `NarHash` to the artifact that holds those NAR bytes.
 const NAR: redb::TableDefinition<'static, &[u8; bincache_core::hash::WIDTH], &[u8]> =
@@ -51,24 +61,74 @@ pub enum Error {
     Decode { source: rkyv::rancor::Error },
 }
 
+/// Whether every record in the index has a body projected beside it.
+///
+/// Settled once at open rather than asked per request. Every write path here touches both
+/// tables, so two tables that agree in length go on agreeing, and on such an index a [`BODY`]
+/// miss already means the path is absent. That is what keeps a miss to a single lookup, which
+/// is the case that matters: closure resolution asks about hundreds of paths a cache does not
+/// hold for every one it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Projection {
+    Complete,
+    Partial,
+}
+
 /// Cheap to clone: shards share one instance built at the composition root.
 #[derive(Clone)]
 pub struct Index {
     database: std::sync::Arc<redb::Database>,
+    projection: Projection,
 }
 
 impl Index {
-    /// Opens, creating the file if it is absent. Both tables are created here so a read on
+    /// Opens, creating the file if it is absent. Every table is created here so a read on
     /// a fresh database answers "absent" rather than "no such table".
     pub fn open(path: std::path::PathBuf) -> Result<Self, Error> {
         let database = redb::Database::create(&path).context(OpenSnafu { path: path.clone() })?;
-        let index = Self { database: std::sync::Arc::new(database) };
+        let database = std::sync::Arc::new(database);
 
-        let transaction = index.database.begin_write().context(BeginWriteSnafu)?;
+        let transaction = database.begin_write().context(BeginWriteSnafu)?;
         transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
+        transaction.open_table(BODY).context(TableSnafu { table: BODY.name() })?;
         transaction.open_table(NAR).context(TableSnafu { table: NAR.name() })?;
         transaction.commit().context(CommitSnafu)?;
-        Ok(index)
+
+        let projection = projection(&database)?;
+        Ok(Self { database, projection })
+    }
+
+    /// The bytes a `GET /<hash>.narinfo` writes to the socket.
+    ///
+    /// A hit is one key lookup and one copy. Everything the answer needed (decoding the
+    /// record, rendering seventeen base32 digests, signing) already happened once at
+    /// publish, which is the whole point of the projection: rendering per request cost more
+    /// than the lookup it followed.
+    ///
+    /// On an index this build wrote, that is the whole function. On one whose records predate
+    /// the projection, a miss falls through to rendering from the record, so such an index
+    /// serves correct answers slowly rather than reporting a cache-wide outage. Publishing or
+    /// rotating projects those records, and the next open stops paying for the fallback.
+    pub fn body(
+        &self,
+        key: &bincache_core::storepath::Hash,
+        dir: &bincache_core::storepath::Dir,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let transaction = self.database.begin_read().context(BeginReadSnafu)?;
+        let bodies = transaction.open_table(BODY).context(TableSnafu { table: BODY.name() })?;
+        if let Some(stored) = bodies.get(key.as_bytes()).context(ReadSnafu)? {
+            return Ok(Some(stored.value().to_vec()));
+        }
+        if self.projection == Projection::Complete {
+            return Ok(None);
+        }
+
+        let records =
+            transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
+        let Some(stored) = records.get(key.as_bytes()).context(ReadSnafu)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode_narinfo(stored.value())?.render(dir).into_bytes()))
     }
 
     /// The record for a metadata request. `None` is the common answer: closure resolution
@@ -119,17 +179,23 @@ impl Index {
         transaction.commit().context(CommitSnafu)
     }
 
-    /// The publish. Everything expensive (compression, rendering, signing) already ran; this
-    /// commit is the single point where a path becomes visible to readers.
-    pub fn publish(&self, record: &bincache_core::narinfo::NarInfo) -> Result<(), Error> {
-        let encoded = rkyv::to_bytes(record).context(EncodeSnafu)?;
-        let key = record.store_path.hash().as_bytes();
-
+    /// The publish. Everything expensive (compression, signing, and now rendering) already
+    /// ran; this commit is the single point where a path becomes visible to readers.
+    ///
+    /// `dir` is taken rather than the rendered bytes, so no caller can hand over a body that
+    /// describes a different record than the one it is committing alongside.
+    pub fn publish(
+        &self,
+        record: &bincache_core::narinfo::NarInfo,
+        dir: &bincache_core::storepath::Dir,
+    ) -> Result<(), Error> {
         let transaction = self.database.begin_write().context(BeginWriteSnafu)?;
         {
-            let mut table =
+            let mut records =
                 transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
-            table.insert(key, encoded.as_ref()).context(WriteSnafu)?;
+            let mut bodies =
+                transaction.open_table(BODY).context(TableSnafu { table: BODY.name() })?;
+            project(&mut records, &mut bodies, record, dir)?;
         }
         transaction.commit().context(CommitSnafu)
     }
@@ -142,16 +208,19 @@ impl Index {
     ///
     /// The caller chooses the batch size. One transaction over the whole set would hold
     /// every pending write in memory before the commit.
-    pub fn republish(&self, records: &[bincache_core::narinfo::NarInfo]) -> Result<(), Error> {
+    pub fn republish(
+        &self,
+        records: &[bincache_core::narinfo::NarInfo],
+        dir: &bincache_core::storepath::Dir,
+    ) -> Result<(), Error> {
         let transaction = self.database.begin_write().context(BeginWriteSnafu)?;
         {
             let mut table =
                 transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
+            let mut bodies =
+                transaction.open_table(BODY).context(TableSnafu { table: BODY.name() })?;
             for record in records {
-                let encoded = rkyv::to_bytes(record).context(EncodeSnafu)?;
-                table
-                    .insert(record.store_path.hash().as_bytes(), encoded.as_ref())
-                    .context(WriteSnafu)?;
+                project(&mut table, &mut bodies, record, dir)?;
             }
         }
         transaction.commit().context(CommitSnafu)
@@ -167,7 +236,12 @@ impl Index {
         let removed = {
             let mut table =
                 transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
+            let mut bodies =
+                transaction.open_table(BODY).context(TableSnafu { table: BODY.name() })?;
             let mut nar = transaction.open_table(NAR).context(TableSnafu { table: NAR.name() })?;
+            // The projection goes with the record it projects. Leaving it would keep the
+            // path servable out of the cache after its record was forgotten.
+            bodies.remove(key.as_bytes()).context(WriteSnafu)?;
             match table.remove(key.as_bytes()).context(WriteSnafu)? {
                 None => None,
                 Some(stored) => {
@@ -203,6 +277,33 @@ impl Index {
             transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
         redb::ReadableTableMetadata::len(&table).context(ReadSnafu)
     }
+}
+
+/// Whether the record table and the projection agree in length, which is what settles
+/// [`Projection`]. `redb` tracks table length, so this is a metadata read and not a walk.
+fn projection(database: &redb::Database) -> Result<Projection, Error> {
+    let transaction = database.begin_read().context(BeginReadSnafu)?;
+    let records = transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
+    let bodies = transaction.open_table(BODY).context(TableSnafu { table: BODY.name() })?;
+    let complete = redb::ReadableTableMetadata::len(&records).context(ReadSnafu)?
+        == redb::ReadableTableMetadata::len(&bodies).context(ReadSnafu)?;
+    if complete { Ok(Projection::Complete) } else { Ok(Projection::Partial) }
+}
+
+/// Writes a record and the body it renders to. Both tables belong to the caller's
+/// transaction, so the two land in one commit: a body that describes a different record than
+/// the one beside it is a lie the read path has no way to detect.
+fn project(
+    records: &mut redb::Table<'_, &[u8; bincache_core::storepath::HASH_WIDTH], &[u8]>,
+    bodies: &mut redb::Table<'_, &[u8; bincache_core::storepath::HASH_WIDTH], &[u8]>,
+    record: &bincache_core::narinfo::NarInfo,
+    dir: &bincache_core::storepath::Dir,
+) -> Result<(), Error> {
+    let key = record.store_path.hash().as_bytes();
+    let encoded = rkyv::to_bytes(record).context(EncodeSnafu)?;
+    records.insert(key, encoded.as_ref()).context(WriteSnafu)?;
+    bodies.insert(key, record.render(dir).as_bytes()).context(WriteSnafu)?;
+    Ok(())
 }
 
 fn decode_narinfo(bytes: &[u8]) -> Result<bincache_core::narinfo::NarInfo, Error> {
@@ -270,11 +371,69 @@ mod tests {
     fn publishes_and_reads_back_an_exact_record() {
         let index = crate::index::Index::open(path("publish")).expect("opens");
         let published = record("hello");
-        index.publish(&published).expect("publishes");
+        index.publish(&published, &dir()).expect("publishes");
 
         let read = index.narinfo(published.store_path.hash()).expect("reads").expect("present");
         assert_eq!(read, published);
         assert_eq!(read.render(&dir()), published.render(&dir()));
+    }
+
+    /// The projection is what a `GET` answers with, so it has to be byte-identical to what
+    /// rendering the record produces. A drift between the two is invisible to the read path.
+    #[test]
+    fn the_projected_body_is_what_rendering_the_record_produces() {
+        let index = crate::index::Index::open(path("body")).expect("opens");
+        let published = record("hello");
+        index.publish(&published, &dir()).expect("publishes");
+
+        let body =
+            index.body(published.store_path.hash(), &dir()).expect("reads").expect("present");
+        assert_eq!(String::from_utf8(body).expect("utf8"), published.render(&dir()));
+    }
+
+    /// A record written before the projection existed still answers, by rendering. Without
+    /// this the read path would report every such path as absent, which is a silent
+    /// cache-wide outage rather than a slow start.
+    #[test]
+    fn a_record_with_no_projected_body_still_answers() {
+        let path = path("unprojected");
+        let published = record("hello");
+
+        // Exactly what an older build left behind: the record, and no projection beside it.
+        // Written before the index is opened, because that is when the two are compared.
+        {
+            let database = redb::Database::create(&path).expect("creates");
+            let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&published).expect("encodes");
+            let transaction = database.begin_write().expect("begins");
+            {
+                let mut records = transaction.open_table(crate::index::NARINFO).expect("opens");
+                records
+                    .insert(published.store_path.hash().as_bytes(), encoded.as_ref())
+                    .expect("inserts");
+            }
+            transaction.commit().expect("commits");
+        }
+
+        let index = crate::index::Index::open(path).expect("opens");
+        let body =
+            index.body(published.store_path.hash(), &dir()).expect("reads").expect("present");
+        assert_eq!(String::from_utf8(body).expect("utf8"), published.render(&dir()));
+
+        // An absent key on that same index is still absent, not a fallback that misreports.
+        let missing = bincache_core::storepath::Hash::from_bytes([0u8; 20]);
+        assert!(index.body(&missing, &dir()).expect("reads").is_none());
+    }
+
+    /// A delete has to take the projection with it. Leaving it would keep the path servable
+    /// out of the cache after its record was forgotten.
+    #[test]
+    fn unpublish_forgets_the_projected_body_too() {
+        let index = crate::index::Index::open(path("unpublish-body")).expect("opens");
+        let published = record("hello");
+        index.publish(&published, &dir()).expect("publishes");
+        index.unpublish(published.store_path.hash()).expect("unpublishes").expect("present");
+
+        assert!(index.body(published.store_path.hash(), &dir()).expect("reads").is_none());
     }
 
     #[test]
@@ -289,8 +448,8 @@ mod tests {
     fn republishing_the_same_path_is_idempotent() {
         let index = crate::index::Index::open(path("idempotent")).expect("opens");
         let published = record("hello");
-        index.publish(&published).expect("publishes");
-        index.publish(&published).expect("republishes");
+        index.publish(&published, &dir()).expect("publishes");
+        index.publish(&published, &dir()).expect("republishes");
         assert_eq!(index.count().expect("counts"), 1);
     }
 
@@ -305,7 +464,7 @@ mod tests {
             compression: published.compression,
         };
         index.put_nar(&published.nar_hash, &entry).expect("stages");
-        index.publish(&published).expect("publishes");
+        index.publish(&published, &dir()).expect("publishes");
 
         let removed =
             index.unpublish(published.store_path.hash()).expect("unpublishes").expect("present");
@@ -334,7 +493,7 @@ mod tests {
     fn records_lists_everything_published() {
         let index = crate::index::Index::open(path("records")).expect("opens");
         for name in ["one", "two", "three"] {
-            index.publish(&record(name)).expect("publishes");
+            index.publish(&record(name), &dir()).expect("publishes");
         }
         assert_eq!(index.records().expect("lists").len(), 3);
         assert_eq!(index.count().expect("counts"), 3);
@@ -348,7 +507,7 @@ mod tests {
         let published = record("hello");
         {
             let index = crate::index::Index::open(path.clone()).expect("opens");
-            index.publish(&published).expect("publishes");
+            index.publish(&published, &dir()).expect("publishes");
         }
         let index = crate::index::Index::open(path).expect("reopens");
         assert_eq!(index.narinfo(published.store_path.hash()).expect("reads"), Some(published));

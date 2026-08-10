@@ -1,9 +1,10 @@
 //! The narinfo record: the object the whole read path exists to return.
 //!
-//! Stored as fields rather than as rendered bytes, per `research/DESIGN_V2.md`
-//! ("What gets prerendered"), so the render format can change and the signing key can
-//! rotate without a data migration. Rendering produces a **body**; framing belongs to
-//! `bincache-serve`.
+//! Stored as fields, per `research/DESIGN_V2.md` ("What gets prerendered"), so the signing
+//! key rotates by rewriting records. [`NarInfo::render`] runs at publish rather than per
+//! request, and `bincache-index` keeps its output beside the record; changing the format
+//! here means rewriting those bodies, which `bincache rotate` already does. Rendering
+//! produces a **body**; framing belongs to `bincache-serve`.
 
 pub mod parse;
 

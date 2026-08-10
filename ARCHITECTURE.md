@@ -13,15 +13,18 @@ including verifying the ed25519 signature the way a client verifies it.
 
 Deferred on purpose, with the reasoning in `research/DESIGN_V2.md`: the RAM projection in
 front of `redb`, TLS, HTTP/2, garbage collection, and the negative-lookup filter tier.
+Rendering the narinfo body per request was measured and moved to publish time; the profile
+behind that is in this file's history rather than in `DESIGN_V2.md`.
 
 ## The one sentence
 
 A narinfo body and its signature are computed once, at upload time, from fields the server
-verified itself. Serving one is a key lookup plus a render plus a write.
+verified itself. Serving one is a key lookup plus a write.
 
 Everything else is one of three things:
 
-1. Making that lookup fast (the KV store now, a derived RAM projection later).
+1. Making that lookup fast (the KV store now, with the rendered body projected beside each
+   record, and a derived RAM projection later).
 2. Getting NAR bytes to the socket in bounded chunks without buffering the whole artifact.
 3. Making sure a crash leaves either nothing or an orphan file, never a lie.
 
@@ -47,7 +50,8 @@ Crates split by who owns what, not by feature.
   fingerprint, ed25519 keys and signatures, and `narurl` as the single owner of the
   `nar/<file hash>.nar<ext>` convention in both directions. No I/O, no async, no sibling
   deps.
-- **`bincache-index`** is the `redb` schema. Two tables, `rkyv`-encoded values.
+- **`bincache-index`** is the `redb` schema. Three tables: the records, the bodies they
+  render to, and the NAR entries.
 - **`bincache-store`** is the filesystem: content-addressed artifacts, atomic appearance,
   reader handles, and the scan that finds orphans.
 - **`bincache-ingest`** is the only writer. The typestate upload machine, the publish, push
@@ -71,9 +75,9 @@ core  <-  index  <-  ingest  <-  serve  <-  bincache
 1. `serve` reads the socket into the connection's buffer and parses HTTP/1.1 by hand.
 2. `route` decodes the 32-character base32 key into `core::storepath::Hash`. Malformed
    input dies here with a 400, before touching any data structure.
-3. `index` reads the record out of `redb`.
-4. `core` renders the body from the record's fields.
-5. `serve` builds the framing and writes head and body in one buffer.
+3. `index` reads the body out of `redb`, already rendered. A record with none projected
+   beside it renders on the spot, which is what an index written by an older build gets.
+4. `serve` builds the framing and writes head and body in one buffer.
 
 `HEAD` renders the same body, reports its length, and writes no body. That is the whole
 reason the stored artifact is a *body* rather than a framed response: HTTP/2 becomes a
@@ -104,7 +108,7 @@ PUT /nar/<nar hash>.nar         the target states what the body must hash to
 
 PUT /<hash>.narinfo             the publish
   parse, look up the NAR entry, take every payload field from what was received,
-  discard the client's signatures, sign, commit
+  discard the client's signatures, sign, render, commit
 ```
 
 Each transition consumes `self`, and `store` exists only on `Upload<Verified>`, so
@@ -126,8 +130,9 @@ replay: a `redb` commit is the publish.
 If you retain nothing else, retain these.
 
 **The verified record.** `ingest` produces it from bytes it hashed itself, `core` renders
-and signs it, `index` stores it, `serve` renders it again per request. Every field
-describing the payload comes from what arrived, never from what the client claimed.
+and signs it, `index` stores the record and the body together in one commit, `serve` copies
+that body to the socket. Every field describing the payload comes from what arrived, never
+from what the client claimed.
 
 **The content-addressed name.** `core::narurl` owns it, `store` turns it into a path,
 `serve` routes on it, and the `PUT` target carries the hash the body must match. That last

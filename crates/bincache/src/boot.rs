@@ -166,11 +166,13 @@ fn delete(args: crate::args::Delete) -> Result<(), Error> {
         .context(PathSnafu { path: args.path.clone() })?;
 
     let artifacts = open(&args.storage)?;
-    let deleted = compio::runtime::Runtime::new()
-        .context(RuntimeSnafu)?
-        .block_on(bincache_ingest::maintain::delete(&artifacts.store, &artifacts.index, &key))
-        .context(MaintainSnafu)?;
+    let deleted =
+        bincache_ingest::maintain::delete(&artifacts.index, &key).context(MaintainSnafu)?;
     println!("{key}: {deleted:?}");
+    if deleted == bincache_ingest::maintain::Deleted::Removed {
+        // The artifact stays: another path may share it. `reconcile` is what decides.
+        println!("its artifact was left in place; run `reconcile` to list what is unreferenced");
+    }
     Ok(())
 }
 

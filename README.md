@@ -97,6 +97,10 @@ bincache delete    --data-dir /var/lib/bincache <32-char store path hash>
 bincache rotate    --data-dir /var/lib/bincache --secret-key-file <new key>
 ```
 
+`delete` forgets the record and leaves the artifact. A NAR does not include the store path
+name, so two paths with identical contents share one artifact, and unlinking it would strand
+the other. `reconcile` lists what is left unreferenced.
+
 `rotate` replaces the signature on every record rather than adding one, so the old key
 verifies nothing afterwards. Order matters:
 

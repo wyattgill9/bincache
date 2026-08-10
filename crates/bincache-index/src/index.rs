@@ -134,6 +134,29 @@ impl Index {
         transaction.commit().context(CommitSnafu)
     }
 
+    /// Republishes many records in one transaction.
+    ///
+    /// `redb` fsyncs on commit, so a caller that publishes in a loop pays one fsync per
+    /// record. That is fine for a push, which is one record arriving on its own, and ruinous
+    /// for a signing-key rotation, which rewrites every record the cache holds.
+    ///
+    /// The caller chooses the batch size. One transaction over the whole set would hold
+    /// every pending write in memory before the commit.
+    pub fn republish(&self, records: &[bincache_core::narinfo::NarInfo]) -> Result<(), Error> {
+        let transaction = self.database.begin_write().context(BeginWriteSnafu)?;
+        {
+            let mut table =
+                transaction.open_table(NARINFO).context(TableSnafu { table: NARINFO.name() })?;
+            for record in records {
+                let encoded = rkyv::to_bytes(record).context(EncodeSnafu)?;
+                table
+                    .insert(record.store_path.hash().as_bytes(), encoded.as_ref())
+                    .context(WriteSnafu)?;
+            }
+        }
+        transaction.commit().context(CommitSnafu)
+    }
+
     /// Operator-triggered delete. Returns the record so the caller can unlink the artifact
     /// it named; the index performs no filesystem work of its own.
     pub fn unpublish(

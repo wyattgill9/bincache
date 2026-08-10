@@ -188,6 +188,11 @@ mod tests {
 
     const PATH: &str = "5rnvz1n7hdmvbdzq0d5m5xrz3xz6ky8j-hello-2.12.1";
 
+    /// A second store path differing only in its hash. A NAR does not include the store
+    /// path name, so both paths serialize to the same bytes, hash to the same `NarHash`,
+    /// and share one artifact on disk.
+    const SIBLING: &str = "9xkzq1n7hdmvbdzq0d5m5xrz3xz6ky8j-hello-2.12.1";
+
     /// What `nix copy --to 'http://host?compression=none'` renders and uploads.
     fn client_narinfo(body: &[u8]) -> String {
         let hash = bincache_core::hash::Sha256::digest(body);
@@ -295,25 +300,67 @@ mod tests {
     }
 
     #[compio::test]
-    async fn delete_removes_both_the_record_and_the_artifact() {
+    async fn delete_forgets_the_record_and_leaves_the_artifact() {
         let ingest = ingest("delete").await;
         let body = b"nix-archive-1 deletable".repeat(10);
         upload(&ingest, &body).await;
         let record = ingest.publish(&client_narinfo(&body)).expect("publishes");
 
         let key = *record.store_path.hash();
-        let store = ingest.store();
         let index = ingest.index();
         assert_eq!(
-            crate::maintain::delete(store, index, &key).await.expect("deletes"),
+            crate::maintain::delete(index, &key).expect("deletes"),
             crate::maintain::Deleted::Removed
         );
         assert!(index.narinfo(&key).expect("reads").is_none());
-        assert!(store.read(&record.nar()).await.expect("reads").is_none());
+
+        // The artifact stays. Whether anything still needs it is reconcile's question.
+        assert!(ingest.store().read(&record.nar()).await.expect("reads").is_some());
         assert_eq!(
-            crate::maintain::delete(store, index, &key).await.expect("deletes"),
+            crate::maintain::delete(index, &key).expect("deletes"),
             crate::maintain::Deleted::Absent
         );
+    }
+
+    /// Two paths with identical contents share one artifact. Deleting either must leave the
+    /// other servable, or a client that already resolved its narinfo asks for bytes that
+    /// are gone.
+    #[compio::test]
+    async fn deleting_one_path_leaves_a_sibling_that_shares_its_nar_servable() {
+        let ingest = ingest("shared-nar").await;
+        let body = b"nix-archive-1 shared".repeat(10);
+        upload(&ingest, &body).await;
+
+        let first = ingest.publish(&client_narinfo(&body)).expect("publishes");
+        let second =
+            ingest.publish(&client_narinfo(&body).replace(PATH, SIBLING)).expect("publishes");
+        assert_eq!(first.nar_hash, second.nar_hash, "the two paths share a NAR");
+        assert_eq!(first.file_hash, second.file_hash, "and therefore one artifact");
+
+        crate::maintain::delete(ingest.index(), first.store_path.hash()).expect("deletes");
+
+        assert!(
+            ingest.index().narinfo(second.store_path.hash()).expect("reads").is_some(),
+            "the sibling is still published"
+        );
+        assert!(
+            ingest.store().read(&second.nar()).await.expect("reads").is_some(),
+            "and its artifact survived the other path's delete"
+        );
+    }
+
+    /// The artifact a delete leaves behind is exactly what reconcile exists to surface.
+    #[compio::test]
+    async fn reconcile_reports_what_a_delete_left_behind() {
+        let ingest = ingest("reconcile-after-delete").await;
+        let body = b"nix-archive-1 leftover".repeat(10);
+        upload(&ingest, &body).await;
+        let record = ingest.publish(&client_narinfo(&body)).expect("publishes");
+
+        crate::maintain::delete(ingest.index(), record.store_path.hash()).expect("deletes");
+        let found = crate::maintain::reconcile(ingest.store(), ingest.index()).expect("reconciles");
+        assert_eq!(found.orphan_artifacts, vec![record.nar()]);
+        assert!(found.records_without_artifacts.is_empty());
     }
 
     #[compio::test]
@@ -332,6 +379,56 @@ mod tests {
             crate::maintain::reconcile(ingest.store(), ingest.index()).expect("reconciles");
         assert!(reconciliation.orphan_artifacts.is_empty());
         assert!(reconciliation.records_without_artifacts.is_empty());
+    }
+
+    /// More records than one batch, so the chunk boundary is exercised rather than assumed.
+    ///
+    /// The records are clones of one real publish under distinct store paths: rotation
+    /// re-signs whatever the index holds, and what is under test is the batching, not the
+    /// upload path that put them there.
+    #[compio::test]
+    async fn rotate_re_signs_every_record_across_batch_boundaries() {
+        let ingest = ingest("rotate-batches").await;
+        let body = b"nix-archive-1 batched".repeat(10);
+        upload(&ingest, &body).await;
+        let published = ingest.publish(&client_narinfo(&body)).expect("publishes");
+
+        // Seeded through the batch API. Writing 2500 records one commit at a time is the
+        // cost this change exists to remove, and paying it in a test fixture would make the
+        // suite slow for the same reason a rotation was.
+        let count: u64 = 2500;
+        let clones: Vec<bincache_core::narinfo::NarInfo> = (0..count)
+            .map(|n| {
+                let mut record = published.clone();
+                record.store_path = bincache_core::storepath::Path::new(
+                    bincache_core::storepath::Hash::from_bytes(seeded_key(n)),
+                    bincache_core::storepath::Name::new(format!("batched-{n}")).expect("legal"),
+                );
+                record
+            })
+            .collect();
+        ingest.index().republish(&clones).expect("seeds");
+        let total = ingest.index().count().expect("counts");
+        assert_eq!(total, count + 1, "one real publish plus the clones");
+
+        let key = bincache_core::sign::SecretKey::generate("bincache-test-2".to_owned());
+        let rotated = crate::maintain::rotate(ingest.index(), ingest.dir(), &key).expect("rotates");
+        assert_eq!(u64::try_from(rotated).expect("fits"), total);
+
+        for record in ingest.index().records().expect("lists") {
+            assert_eq!(record.sigs.len(), 1);
+            assert_eq!(record.sigs[0].name(), "bincache-test-2");
+            key.public()
+                .verify(&record.fingerprint(ingest.dir()), &record.sigs[0])
+                .expect("verifies under the new key");
+        }
+    }
+
+    fn seeded_key(n: u64) -> [u8; bincache_core::storepath::HASH_WIDTH] {
+        let digest = bincache_core::hash::Sha256::digest(&n.to_le_bytes());
+        let mut raw = [0u8; bincache_core::storepath::HASH_WIDTH];
+        raw.copy_from_slice(&digest.as_bytes()[..bincache_core::storepath::HASH_WIDTH]);
+        raw
     }
 
     #[compio::test]

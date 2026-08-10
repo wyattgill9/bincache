@@ -85,7 +85,11 @@ class Checks:
             connection.request(method, target, body=body, headers=headers or {})
             response = connection.getresponse()
             payload = response.read()
-            return response.status, {k.lower(): v for k, v in response.getheaders()}, payload
+            return (
+                response.status,
+                {k.lower(): v for k, v in response.getheaders()},
+                payload,
+            )
         finally:
             connection.close()
 
@@ -101,7 +105,9 @@ class Checks:
         self.check(name, actual == expected, f"got {actual!r}, wanted {expected!r}")
 
 
-def fingerprint(store_path: str, nar_hash32: str, nar_size: int, references: list[str]) -> bytes:
+def fingerprint(
+    store_path: str, nar_hash32: str, nar_size: int, references: list[str]
+) -> bytes:
     """`ValidPathInfo::fingerprint` in nix/src/libstore/path-info.cc."""
     joined = ",".join(sorted(references))
     return f"1;{store_path};sha256:{nar_hash32};{nar_size};{joined}".encode()
@@ -130,14 +136,19 @@ def run(base_url: str, token: str, public_key: str) -> int:
     status, _, _ = checks.request("PUT", f"/nar/{nar_hash32}.nar", body=b"x")
     checks.equal("an unauthenticated PUT is refused", status, 401)
     status, _, _ = checks.request(
-        "PUT", f"/nar/{nar_hash32}.nar", body=b"x", headers={"Authorization": "Bearer wrong"}
+        "PUT",
+        f"/nar/{nar_hash32}.nar",
+        body=b"x",
+        headers={"Authorization": "Bearer wrong"},
     )
     checks.equal("a wrong token is refused", status, 401)
 
     print("\nupload rejects what it cannot verify")
     # A target naming bytes that are never uploaded, so this holds on a warm store too.
     poison32 = nix_base32(hashlib.sha256(b"bytes that are never uploaded").digest())
-    status, _, _ = checks.request("PUT", f"/nar/{poison32}.nar", body=b"not the nar", headers=auth)
+    status, _, _ = checks.request(
+        "PUT", f"/nar/{poison32}.nar", body=b"not the nar", headers=auth
+    )
     checks.equal("a body that does not match the target hash is refused", status, 400)
     status, _, _ = checks.request("HEAD", f"/nar/{poison32}.nar", headers=auth)
     checks.equal("the refused upload left nothing durable", status, 404)
@@ -149,7 +160,9 @@ def run(base_url: str, token: str, public_key: str) -> int:
 
     print("\nupload")
     # `nix copy --to 'http://host?compression=none'` PUTs the NAR, then the narinfo.
-    status, _, _ = checks.request("PUT", f"/nar/{nar_hash32}.nar", body=nar, headers=auth)
+    status, _, _ = checks.request(
+        "PUT", f"/nar/{nar_hash32}.nar", body=nar, headers=auth
+    )
     checks.equal("the NAR upload is accepted", status, 201)
 
     status, _, _ = checks.request("HEAD", f"/nar/{nar_hash32}.nar", headers=auth)
@@ -169,14 +182,22 @@ def run(base_url: str, token: str, public_key: str) -> int:
         f"NarSize: {len(nar)}\n"
         f"References: \n"
     ).encode()
-    status, _, _ = checks.request("PUT", f"/{path_hash32}.narinfo", body=narinfo, headers=auth)
+    status, _, _ = checks.request(
+        "PUT", f"/{path_hash32}.narinfo", body=narinfo, headers=auth
+    )
     checks.equal("the narinfo publish is accepted", status, 201)
 
     print("\nmetadata plane")
     status, headers, body = checks.request("GET", f"/{path_hash32}.narinfo")
     checks.equal("the published narinfo is served", status, 200)
-    checks.equal("narinfo Content-Type", headers.get("content-type"), "text/x-nix-narinfo")
-    checks.check("no Content-Encoding on narinfo", "content-encoding" not in headers, str(headers))
+    checks.equal(
+        "narinfo Content-Type", headers.get("content-type"), "text/x-nix-narinfo"
+    )
+    checks.check(
+        "no Content-Encoding on narinfo",
+        "content-encoding" not in headers,
+        str(headers),
+    )
 
     published: dict[str, list[str]] = {}
     for line in body.decode().splitlines():
@@ -186,11 +207,21 @@ def run(base_url: str, token: str, public_key: str) -> int:
         elif line.endswith(":"):
             published.setdefault(line[:-1], []).append("")
 
-    checks.equal("StorePath round-trips", published.get("StorePath", [None])[0], store_path)
-    checks.equal("NarHash round-trips", published.get("NarHash", [None])[0], f"sha256:{nar_hash32}")
-    checks.equal("NarSize round-trips", published.get("NarSize", [None])[0], str(len(nar)))
     checks.equal(
-        "the server recompressed to zstd", published.get("Compression", [None])[0], "zstd"
+        "StorePath round-trips", published.get("StorePath", [None])[0], store_path
+    )
+    checks.equal(
+        "NarHash round-trips",
+        published.get("NarHash", [None])[0],
+        f"sha256:{nar_hash32}",
+    )
+    checks.equal(
+        "NarSize round-trips", published.get("NarSize", [None])[0], str(len(nar))
+    )
+    checks.equal(
+        "the server recompressed to zstd",
+        published.get("Compression", [None])[0],
+        "zstd",
     )
     checks.check("the server signed it", "Sig" in published, str(published.keys()))
 
@@ -220,10 +251,14 @@ def run(base_url: str, token: str, public_key: str) -> int:
         str(published.keys()),
     )
 
-    head_status, head_headers, head_body = checks.request("HEAD", f"/{path_hash32}.narinfo")
+    head_status, head_headers, head_body = checks.request(
+        "HEAD", f"/{path_hash32}.narinfo"
+    )
     checks.equal("HEAD on narinfo answers 200", head_status, 200)
     checks.equal(
-        "HEAD reuses the body length", head_headers.get("content-length"), str(len(body))
+        "HEAD reuses the body length",
+        head_headers.get("content-length"),
+        str(len(body)),
     )
     checks.equal("HEAD writes no body", head_body, b"")
 
@@ -231,24 +266,36 @@ def run(base_url: str, token: str, public_key: str) -> int:
     nar_url = "/" + published["URL"][0]
     status, headers, artifact = checks.request("GET", nar_url)
     checks.equal("the artifact is served", status, 200)
-    checks.equal("NAR Content-Type", headers.get("content-type"), "application/x-nix-nar")
+    checks.equal(
+        "NAR Content-Type", headers.get("content-type"), "application/x-nix-nar"
+    )
 
     # Both of these decide whether a dropped 10 GB transfer resumes or restarts at zero.
     # `maybeRetry` in nix/src/libstore/filetransfer.cc requires the first and refuses the
     # second.
-    checks.equal("Accept-Ranges: bytes is advertised", headers.get("accept-ranges"), "bytes")
-    checks.check(
-        "no Content-Encoding on the NAR", "content-encoding" not in headers, str(headers)
+    checks.equal(
+        "Accept-Ranges: bytes is advertised", headers.get("accept-ranges"), "bytes"
     )
-    checks.equal("Content-Length matches the body", int(headers["content-length"]), len(artifact))
-    checks.equal("FileSize matches what is served", published["FileSize"][0], str(len(artifact)))
+    checks.check(
+        "no Content-Encoding on the NAR",
+        "content-encoding" not in headers,
+        str(headers),
+    )
+    checks.equal(
+        "Content-Length matches the body", int(headers["content-length"]), len(artifact)
+    )
+    checks.equal(
+        "FileSize matches what is served", published["FileSize"][0], str(len(artifact))
+    )
     checks.equal(
         "FileHash names the artifact",
         published["FileHash"][0],
         "sha256:" + nix_base32(hashlib.sha256(artifact).digest()),
     )
 
-    decompressed = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(artifact)).read()
+    decompressed = (
+        zstandard.ZstdDecompressor().stream_reader(io.BytesIO(artifact)).read()
+    )
     checks.equal("the artifact decompresses to the uploaded NAR", decompressed, nar)
     checks.equal(
         "the decompressed bytes hash to the published NarHash",
@@ -271,7 +318,9 @@ def run(base_url: str, token: str, public_key: str) -> int:
     )
     checks.equal("the resumed body is the tail", partial, artifact[resume_at:])
     checks.equal(
-        "a resumed response still advertises ranges", headers.get("accept-ranges"), "bytes"
+        "a resumed response still advertises ranges",
+        headers.get("accept-ranges"),
+        "bytes",
     )
 
     status, headers, _ = checks.request(
@@ -279,7 +328,9 @@ def run(base_url: str, token: str, public_key: str) -> int:
     )
     checks.equal("a range past the end answers 416", status, 416)
     checks.equal(
-        "416 reports the full length", headers.get("content-range"), f"bytes */{len(artifact)}"
+        "416 reports the full length",
+        headers.get("content-range"),
+        f"bytes */{len(artifact)}",
     )
 
     print("\nmisses and malformed input")
@@ -296,9 +347,13 @@ def run(base_url: str, token: str, public_key: str) -> int:
     checks.equal("an unserved route is a 404", status, 404)
 
     print("\nidempotence")
-    status, _, _ = checks.request("PUT", f"/nar/{nar_hash32}.nar", body=nar, headers=auth)
+    status, _, _ = checks.request(
+        "PUT", f"/nar/{nar_hash32}.nar", body=nar, headers=auth
+    )
     checks.equal("re-uploading the same NAR is accepted", status, 201)
-    status, _, _ = checks.request("PUT", f"/{path_hash32}.narinfo", body=narinfo, headers=auth)
+    status, _, _ = checks.request(
+        "PUT", f"/{path_hash32}.narinfo", body=narinfo, headers=auth
+    )
     checks.equal("re-publishing the same path is accepted", status, 201)
     status, _, again = checks.request("GET", f"/{path_hash32}.narinfo")
     checks.equal("the record is unchanged after a repeat push", again, body)

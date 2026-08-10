@@ -74,6 +74,12 @@ pub enum Error {
 
     #[snafu(display("Content-Length is not an integer"))]
     Length { source: core::num::ParseIntError },
+
+    #[snafu(display(
+        "the request carries both Content-Length and Transfer-Encoding, so where its body \
+         ends depends on who is reading"
+    ))]
+    ConflictingFraming,
 }
 
 #[derive(Debug)]
@@ -134,8 +140,14 @@ fn absorb<'a>(request: &mut Request<'a>, line: &'a str) -> Result<(), Error> {
 
     // Field names are case-insensitive, and curl does not promise a spelling.
     if name.eq_ignore_ascii_case("content-length") {
+        // RFC 9112 6.1: when both framings are present the message is ambiguous, and two
+        // recipients that resolve it differently disagree about where this request ends and
+        // the next one begins. Refusing is mandatory, and refusing in *both* orders matters:
+        // assigning unconditionally here is what let the later header silently win.
+        snafu::ensure!(request.framing != Framing::Chunked, ConflictingFramingSnafu);
         request.framing = Framing::Length(value.parse().context(LengthSnafu)?);
     } else if name.eq_ignore_ascii_case("transfer-encoding") {
+        snafu::ensure!(!matches!(request.framing, Framing::Length(_)), ConflictingFramingSnafu);
         request.framing = Framing::Chunked;
     } else if name.eq_ignore_ascii_case("connection") {
         if value.eq_ignore_ascii_case("close") {
@@ -159,11 +171,29 @@ fn absorb<'a>(request: &mut Request<'a>, line: &'a str) -> Result<(), Error> {
 
 impl Request<'_> {
     /// How many body bytes follow the head, for the routes that take one.
+    ///
+    /// Zero for a chunked body, whose length is not declared anywhere. Use
+    /// [`Request::carries_body`] to ask whether a body is *there*; the two questions are
+    /// different and conflating them is how a chunked body got left in the socket.
     #[must_use]
     pub const fn body_len(&self) -> u64 {
         match self.framing {
             Framing::Length(length) => length,
             Framing::Empty | Framing::Chunked => 0,
+        }
+    }
+
+    /// Whether a body follows that a bodyless answer would leave unread.
+    ///
+    /// A chunked body has no declared length but is still on the wire, so a connection kept
+    /// alive after refusing one hands the next request the chunk data. That is a request
+    /// smuggling primitive, not a cosmetic bug.
+    #[must_use]
+    pub const fn carries_body(&self) -> bool {
+        match self.framing {
+            Framing::Empty => false,
+            Framing::Length(length) => length > 0,
+            Framing::Chunked => true,
         }
     }
 }

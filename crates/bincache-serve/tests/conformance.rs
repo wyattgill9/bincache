@@ -145,6 +145,12 @@ impl Body {
 /// Reads exactly one response, using `Content-Length` for the body, which is the only
 /// framing this server ever emits.
 async fn read_response(stream: &mut compio::net::TcpStream, body: Body) -> Response {
+    try_read_response(stream, body).await.expect("peer closed before a complete response head")
+}
+
+/// [`read_response`], but reporting a closed connection rather than asserting on it. A test
+/// that is checking whether the connection survived has to be able to see that it did not.
+async fn try_read_response(stream: &mut compio::net::TcpStream, body: Body) -> Option<Response> {
     let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
     let head_end = loop {
         if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -155,7 +161,9 @@ async fn read_response(stream: &mut compio::net::TcpStream, body: Body) -> Respo
         let compio::BufResult(read, slice) =
             stream.read(compio::buf::IoBuf::slice(buffer, len..)).await;
         buffer = compio::buf::IntoInner::into_inner(slice);
-        assert!(read.expect("reads") > 0, "peer closed before a complete response head");
+        if read.expect("reads") == 0 {
+            return None;
+        }
     };
 
     let text = String::from_utf8(buffer[..head_end].to_vec()).expect("head is utf8");
@@ -192,7 +200,15 @@ async fn read_response(stream: &mut compio::net::TcpStream, body: Body) -> Respo
         assert!(read.expect("reads") > 0, "peer closed before the body finished");
     }
     body.truncate(length);
-    Response { status, headers, body }
+    Some(Response { status, headers, body })
+}
+
+/// Writes a request without reading the answer, for tests that need the two separated.
+async fn send(stream: &mut compio::net::TcpStream, head: &str, body: &[u8]) {
+    let mut request = head.as_bytes().to_vec();
+    request.extend_from_slice(body);
+    let compio::BufResult(written, _) = stream.write_all(request).await;
+    written.expect("writes the request");
 }
 
 fn fields(body: &[u8]) -> std::collections::HashMap<String, Vec<String>> {
@@ -634,6 +650,74 @@ async fn chunked_uploads_are_refused_rather_than_misparsed() {
         server.token
     );
     assert_eq!(server.request(&head, b"").await.status, 501);
+}
+
+/// A refused chunked body must not stay in the socket to be read as the next request.
+///
+/// The chunk data here spells a complete `GET`. If the connection survives the refusal with
+/// that data unread, the server parses it as a request line and answers a request the
+/// client never framed, which is request smuggling: a proxy in front would attribute the
+/// answer to whoever owns the next request on that connection.
+#[compio::test]
+async fn a_refused_chunked_body_cannot_smuggle_a_second_request() {
+    let server = Server::start("chunked-smuggle").await;
+    let smuggled = "GET /nix-cache-info HTTP/1.1\r\nHost: evil\r\n\r\n";
+    let chunked = format!("{:x}\r\n{smuggled}\r\n0\r\n\r\n", smuggled.len());
+    let head = format!(
+        "PUT /nar/{}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+         Transfer-Encoding: chunked\r\n\r\n",
+        bincache_core::hash::Sha256::digest(b"x").base32(),
+        server.token
+    );
+
+    let mut stream = server.connect().await;
+    let refused = exchange(&mut stream, &head, chunked.as_bytes()).await;
+    assert_eq!(refused.status, 501);
+    assert_eq!(
+        refused.header("Connection"),
+        Some("close"),
+        "a body left unread must close the connection"
+    );
+    assert!(
+        try_read_response(&mut stream, Body::Expected).await.is_none(),
+        "the chunk data was answered as a second request"
+    );
+}
+
+/// RFC 9112 6.1: a message carrying both `Content-Length` and `Transfer-Encoding` is
+/// ambiguously framed and must be refused with `400`, in either header order.
+///
+/// Everything else about this upload is valid: the token is real and the body hashes to
+/// what the target declares. The framing conflict is the only defect, so anything other
+/// than a refusal means the server picked one interpretation and acted on it.
+#[compio::test]
+async fn a_conflicting_framing_is_refused_in_either_order() {
+    let server = Server::start("framing-conflict").await;
+    let body = nar(b"smuggled payload");
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+
+    // The declared length is the real one, so a server that resolves the ambiguity reads a
+    // body that verifies and answers `201`: it stored content from a request whose extent
+    // two recipients would not agree on.
+    for framing in [
+        format!("Transfer-Encoding: chunked\r\nContent-Length: {}", body.len()),
+        format!("Content-Length: {}\r\nTransfer-Encoding: chunked", body.len()),
+    ] {
+        let head = format!(
+            "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+             {framing}\r\n\r\n",
+            server.token
+        );
+        let mut stream = server.connect().await;
+        send(&mut stream, &head, &body).await;
+        let response = read_response(&mut stream, Body::Expected).await;
+        assert_eq!(response.status, 400, "{framing:?} should have been refused");
+        assert_eq!(response.header("Connection"), Some("close"), "{framing:?}");
+    }
+
+    // Nothing was stored from a request the server could not frame.
+    let probe = format!("HEAD /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(server.request(&probe, b"").await.status, 404);
 }
 
 /// curl sets `Expect: 100-continue` on uploads past about a kilobyte and stalls for a

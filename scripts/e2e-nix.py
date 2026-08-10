@@ -72,7 +72,15 @@ def build_unique_path() -> str:
         "}"
     )
     built = run(
-        ["nix", "build", "--impure", "--no-link", "--print-out-paths", "--expr", expression]
+        [
+            "nix",
+            "build",
+            "--impure",
+            "--no-link",
+            "--print-out-paths",
+            "--expr",
+            expression,
+        ]
     )
     return built.stdout.strip().splitlines()[-1]
 
@@ -83,7 +91,9 @@ def wait_for(base_url: str, server: subprocess.Popen[bytes]) -> None:
         if server.poll() is not None:
             raise Failure(f"the server exited early with {server.returncode}")
         try:
-            with urllib.request.urlopen(f"{base_url}/nix-cache-info", timeout=1) as response:
+            with urllib.request.urlopen(
+                f"{base_url}/nix-cache-info", timeout=1
+            ) as response:
                 if response.status == 200:
                     return
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
@@ -92,14 +102,18 @@ def wait_for(base_url: str, server: subprocess.Popen[bytes]) -> None:
 
 
 def check(name: str, condition: bool, detail: str = "") -> bool:
-    print(f"  {'ok  ' if condition else 'FAIL'} {name}{'' if condition else ': ' + detail}")
+    print(
+        f"  {'ok  ' if condition else 'FAIL'} {name}{'' if condition else ': ' + detail}"
+    )
     return condition
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/release/bincache")
-    parser.add_argument("--keep", action="store_true", help="leave the run directory in place")
+    parser.add_argument(
+        "--keep", action="store_true", help="leave the run directory in place"
+    )
     args = parser.parse_args()
 
     binary = pathlib.Path(args.binary).resolve()
@@ -129,12 +143,18 @@ def main() -> int:
     log = (ROOT / "serve.log").open("wb")
     server = subprocess.Popen(
         [
-            str(binary), "serve",
-            "--data-dir", str(ROOT / "data"),
-            "--secret-key-file", str(ROOT / "secret.key"),
-            "--push-token-file", str(ROOT / "push.token"),
-            "--listen", f"127.0.0.1:{port}",
-            "--shards", "2",
+            str(binary),
+            "serve",
+            "--data-dir",
+            str(ROOT / "data"),
+            "--secret-key-file",
+            str(ROOT / "secret.key"),
+            "--push-token-file",
+            str(ROOT / "push.token"),
+            "--listen",
+            f"127.0.0.1:{port}",
+            "--shards",
+            "2",
         ],
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -146,31 +166,71 @@ def main() -> int:
         print(f"  serving on {base_url}")
 
         print("\npush, with a real client")
-        run(["nix", "copy", "--to", f"http://bincache:{token}@127.0.0.1:{port}?compression=none",
-             store_path])
+        run(
+            [
+                "nix",
+                "copy",
+                "--to",
+                f"http://bincache:{token}@127.0.0.1:{port}?compression=none",
+                store_path,
+            ]
+        )
         passed &= check("nix copy --to accepted the path", True)
 
         print("\nread the record back, with a real client")
-        info = run(["nix", "path-info", "--store", base_url, "--json", "--json-format", "1",
-                    store_path])
+        info = run(
+            [
+                "nix",
+                "path-info",
+                "--store",
+                base_url,
+                "--json",
+                "--json-format",
+                "1",
+                store_path,
+            ]
+        )
         record = json.loads(info.stdout)[store_path]
-        passed &= check("the client parsed the narinfo", record is not None, info.stdout)
-        passed &= check("the server recompressed to zstd",
-                        record["compression"] == "zstd", str(record.get("compression")))
-        passed &= check("the record carries bincache's signature",
-                        any(sig.startswith("bincache-e2e-1:") for sig in record["signatures"]),
-                        str(record["signatures"]))
+        passed &= check(
+            "the client parsed the narinfo", record is not None, info.stdout
+        )
+        passed &= check(
+            "the server recompressed to zstd",
+            record["compression"] == "zstd",
+            str(record.get("compression")),
+        )
+        passed &= check(
+            "the record carries bincache's signature",
+            any(sig.startswith("bincache-e2e-1:") for sig in record["signatures"]),
+            str(record["signatures"]),
+        )
 
         print("\nsubstitute into a separate store, signatures checked")
         destination = ROOT / "dest"
-        run(["nix", "copy", "--from", base_url, "--to", str(destination.resolve()),
-             store_path, "--option", "trusted-public-keys", public_key])
+        run(
+            [
+                "nix",
+                "copy",
+                "--from",
+                base_url,
+                "--to",
+                str(destination.resolve()),
+                store_path,
+                "--option",
+                "trusted-public-keys",
+                public_key,
+            ]
+        )
         passed &= check("the client verified the signature and unpacked the NAR", True)
 
         landed = destination / store_path.lstrip("/")
-        passed &= check("the path landed in the destination store", landed.exists(), str(landed))
-        passed &= check("its contents survived the round trip through zstd",
-                        landed.read_text() == contents if landed.exists() else False)
+        passed &= check(
+            "the path landed in the destination store", landed.exists(), str(landed)
+        )
+        passed &= check(
+            "its contents survived the round trip through zstd",
+            landed.read_text() == contents if landed.exists() else False,
+        )
 
         # Negative control. Without this, every check above would still pass if the client
         # were ignoring signatures entirely, and the run would prove nothing about them.
@@ -178,20 +238,37 @@ def main() -> int:
         stranger = run([str(binary), "keygen", "--name", "not-bincache-1"])
         wrong_key = stranger.stderr.split("trusted-public-keys entry: ", 1)[1].strip()
         refused = subprocess.run(
-            ["nix", "copy", "--from", base_url, "--to", str((ROOT / "refused").resolve()),
-             store_path, "--option", "trusted-public-keys", wrong_key],
+            [
+                "nix",
+                "copy",
+                "--from",
+                base_url,
+                "--to",
+                str((ROOT / "refused").resolve()),
+                store_path,
+                "--option",
+                "trusted-public-keys",
+                wrong_key,
+            ],
             capture_output=True,
             text=True,
         )
-        passed &= check("a client trusting a different key refuses the path",
-                        refused.returncode != 0,
-                        "the copy succeeded, so nothing above proved anything about signatures")
+        passed &= check(
+            "a client trusting a different key refuses the path",
+            refused.returncode != 0,
+            "the copy succeeded, so nothing above proved anything about signatures",
+        )
         # Nix words this differently depending on the destination store, so match the
         # subject rather than a phrase: pinning the exact sentence would break on an
         # upstream reword and say nothing about bincache.
-        blamed_the_signature = "signature" in refused.stderr or "public key" in refused.stderr
-        passed &= check("and refuses it for the right reason", blamed_the_signature,
-                        refused.stderr.strip()[-200:])
+        blamed_the_signature = (
+            "signature" in refused.stderr or "public key" in refused.stderr
+        )
+        passed &= check(
+            "and refuses it for the right reason",
+            blamed_the_signature,
+            refused.stderr.strip()[-200:],
+        )
     finally:
         server.terminate()
         server.wait(timeout=10)

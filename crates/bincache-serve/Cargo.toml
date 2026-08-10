@@ -5,26 +5,26 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-bincache-core   = { workspace = true }
-bincache-index  = { workspace = true }
+bincache-core = { workspace = true }
+bincache-index = { workspace = true }
 bincache-ingest = { workspace = true }
-bincache-store  = { workspace = true }
+bincache-store = { workspace = true }
 
-bytes           = { workspace = true }
-compio          = { workspace = true, features = ["net", "io", "runtime", "time"] }
-core_affinity   = { workspace = true }
+bytes = { workspace = true }
+compio = { workspace = true, features = ["net", "io", "runtime", "time"] }
+core_affinity = { workspace = true }
 crossbeam-utils = { workspace = true }
-snafu           = { workspace = true }
-socket2         = { workspace = true }
-strum           = { workspace = true }
-swrite          = { workspace = true }
-tracing         = { workspace = true }
+snafu = { workspace = true }
+socket2 = { workspace = true }
+strum = { workspace = true }
+swrite = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-compio            = { workspace = true, features = ["macros"] }
-expect-test       = { workspace = true }
+compio = { workspace = true, features = ["macros"] }
+expect-test = { workspace = true }
 pretty_assertions = { workspace = true }
-zstd              = { workspace = true }
+zstd = { workspace = true }
 
 [lints]
 workspace = true

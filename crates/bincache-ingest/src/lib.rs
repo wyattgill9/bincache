@@ -1,8 +1,9 @@
-//! The write path: authenticated, latency-tolerant, and the only writer to the index.
+//! The write path: authenticated, latency-tolerant, and the only writer to the data
+//! directory.
 //!
 //! Every expensive computation in the system happens here, exactly once per path:
-//! verification, compression, rendering, and signing. See `research/DESIGN_V2.md`,
-//! "The ingest plane".
+//! verification, compression, rendering, and signing. What the read path serves is what
+//! this produced.
 
 pub mod auth;
 pub mod fault;

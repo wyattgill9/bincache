@@ -1,9 +1,9 @@
 //! The NAR upload pipeline, as a typestate machine.
 //!
 //! ```text
-//! Upload<Receiving> ──▶ Upload<Compressed> ──▶ Upload<Verified> ──▶ nar::Entry
+//! Upload<Receiving> ──▶ Upload<Compressed> ──▶ Upload<Verified> ──▶ receipt::Receipt
 //!   stream + hash          encoder flushed        hash matched        fsync, rename,
-//!   + compress             sizes final            the request target  record
+//!   + compress             sizes final            the request target  write the receipt
 //! ```
 //!
 //! Each transition consumes `self`, and `store` exists only on `Upload<Verified>`, so
@@ -43,7 +43,7 @@ pub enum Error {
 
 impl Error {
     /// A hash mismatch and an empty NAR are statements about the bytes the client sent.
-    /// Everything else here is the staging file, the encoder, or the index failing.
+    /// Everything else here is the staging file, the encoder, or the receipt failing.
     #[must_use]
     pub const fn fault(&self) -> crate::fault::Fault {
         match self {
@@ -127,8 +127,8 @@ impl Upload<Receiving> {
         Ok(Self { staged, expected, state })
     }
 
-    /// Absorbs one chunk. The caller owns the loop and the scheduler yield between chunks,
-    /// so one large upload cannot monopolize the shard it landed on.
+    /// Absorbs one chunk. The caller owns the loop, which awaits per chunk, so a large
+    /// upload yields to its runtime rather than occupying a worker to completion.
     pub async fn write(&mut self, chunk: &[u8]) -> Result<(), Error> {
         self.state.nar.update(chunk);
         self.state.nar_size += u64::try_from(chunk.len()).unwrap_or(u64::MAX);

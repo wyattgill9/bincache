@@ -64,7 +64,7 @@ pub enum Removed {
     Absent,
 }
 
-/// Cheap to clone: shards share one instance built at the composition root.
+/// Cheap to clone: every handler shares one instance built at the composition root.
 #[derive(Clone, Debug)]
 pub struct Store {
     inner: std::sync::Arc<Inner>,
@@ -130,7 +130,7 @@ impl Store {
         Ok(Removed::Deleted)
     }
 
-    /// Every artifact on disk, for reconciliation against the index. Names that do not
+    /// Every artifact on disk, for reconciliation against the published records. Names that do not
     /// parse are reported rather than skipped silently, because an unparseable name under
     /// `nar/` means something other than bincache wrote there.
     pub fn scan(&self) -> Result<Scan, Error> {

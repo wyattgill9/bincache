@@ -14,8 +14,9 @@
 //! axum route table. `resolve` stays the one owner of URL shape, and dispatching on the
 //! method here avoids axum's `MethodRouter`, which answers `HEAD` by running the `GET`
 //! handler and discarding the body. `HEAD /nar/<nar hash>.nar` must not do that: it is the
-//! probe a client runs before uploading, it is answered from the NAR index rather than from
-//! the filesystem, and getting it wrong makes every build node re-upload every NAR forever.
+//! probe a client runs before uploading, it is answered from the NAR receipt rather than
+//! from the artifact, and getting it wrong makes every build node re-upload every NAR
+//! forever.
 
 use snafu::ResultExt as _;
 

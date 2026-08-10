@@ -6,15 +6,13 @@ substitute from it.
 It speaks the binary cache protocol `nix copy` and `substituters` already use, so clients
 need a URL and a public key.
 
-`ARCHITECTURE.md` is the map. `research/DESIGN_V2.md` is the performance argument.
+`ARCHITECTURE.md` is the map.
 
 ## Limits
 
 - No TLS. Terminate it in front, or stay on a trusted network.
 - No garbage collection. The cache grows until you delete something.
 - Clients need Nix 2.4 or newer, because every artifact is stored as zstd.
-- io_uring is used when the host allows it. Docker 25+ and Kubernetes block it by default,
-  and Compio falls back to a polling driver there.
 
 ## Set it up
 
@@ -40,8 +38,8 @@ bincache serve \
 ```
 
 No push credential = a read-only replica. `bincache serve --help` is the full flag list, and
-every flag also takes an env var. The ones worth knowing: `--shards`, `--pin`,
-`--zstd-level` (3), `--priority` (30, where lower wins and `cache.nixos.org` is 40).
+every flag also takes an env var. The ones worth knowing: `--zstd-level` (3) and
+`--priority` (30, where lower wins and `cache.nixos.org` is 40).
 
 ## Push to it
 
@@ -87,15 +85,22 @@ Two things that will otherwise cost you an afternoon:
 ## Operate it
 
 `GET /metrics` serves Prometheus text: request counts, metadata hits and misses, bytes
-served, uploads, rejections, and paths held.
+served, uploads, rejections, and paths held. `bincache_paths` is counted at boot and
+tracked per publish, so a `delete` while the server runs is not reflected until it
+restarts.
 
-These need the server stopped, because `redb` allows one writer process:
+These run against a live server. There is no lock file and no single-writer database, and
+every write is an atomic rename:
 
 ```sh
-bincache reconcile --data-dir /var/lib/bincache   # payload tree against index, both ways
+bincache reconcile --data-dir /var/lib/bincache   # payload tree against records, both ways
 bincache delete    --data-dir /var/lib/bincache <32-char store path hash>
 bincache rotate    --data-dir /var/lib/bincache --secret-key-file <new key>
 ```
+
+`delete` forgets the record and leaves the artifact. A NAR does not include the store path
+name, so two paths with identical contents share one artifact, and unlinking it would
+strand the other. `reconcile` reports what is left unreferenced.
 
 `rotate` replaces the signature on every record rather than adding one, so the old key
 verifies nothing afterwards. Order matters:
@@ -135,8 +140,8 @@ what CI does.
 
 Three layers of test, in increasing strength:
 
-- `crates/bincache-serve/tests/conformance.rs` runs a shard on a real socket and asserts the
-  exact bytes a Nix client depends on. Part of `cargo nextest run`.
+- `crates/bincache-serve/tests/conformance.rs` runs a real server on a real socket and
+  asserts the exact bytes a Nix client depends on. Part of `cargo nextest run`.
 - `scripts/conformance.py` asserts the same against a running process, and verifies the
   served signature over the canonical fingerprint the way a client does.
 - `scripts/e2e-nix.py` is the one that proves it works. It pushes a freshly built path,
@@ -156,9 +161,18 @@ test using one passes even when the signature is wrong.
 ```
 crates/
   bincache-core/     types, base32, narinfo render and parse, fingerprint, signing
-  bincache-index/    redb schema, rkyv records
-  bincache-store/    content-addressed NAR files, atomic placement, orphan scan
+  bincache-store/    the data directory: artifacts, published records, receipts
   bincache-ingest/   upload state machine, publish, auth, maintenance
-  bincache-serve/    shards, HTTP/1.1, routing, ranges, counters
+  bincache-serve/    axum router, routing, ranges, counters
   bincache/          config, boot, wiring
+```
+
+On disk:
+
+```
+<data-dir>/
+  narinfo/<store path hash>.narinfo   the exact bytes GET returns
+  bynar/<nar hash>                    "<file hash> <file size> <nar size>"
+  nar/<ab>/<file hash>.nar.zst        the compressed artifact
+  staging/                            uploads that have not committed
 ```

@@ -1,3 +1,18 @@
+> **Superseded in part.** This document argued for a `redb` index of `rkyv` records with a
+> RAM projection of pre-rendered bodies in front of it, and for thread-per-core on Compio
+> with `SO_REUSEPORT`, core pinning, and a stall watchdog. None of that shipped, and none of
+> it is coming back.
+>
+> What shipped instead: rendered narinfo bodies as files, so serving one is an `open` and a
+> `write` with nothing to project into RAM; and tokio with axum, so hyper owns HTTP framing
+> and there are no shards to skew, wedge, or watch. The index layer it describes was deleted
+> along with the crate that held it.
+>
+> The parts that remain true are the protocol research: client behaviours, the narinfo
+> field set, the fingerprint, resume and `Accept-Ranges`, and the zstd client floor. Those
+> are load-bearing and are asserted by the conformance suites. Read `ARCHITECTURE.md` for
+> what the system actually is.
+
 ---
 tags:
   - rust

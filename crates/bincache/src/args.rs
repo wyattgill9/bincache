@@ -33,7 +33,7 @@ pub enum Command {
 /// Where the two durable artifacts live. Shared by every subcommand that touches them.
 #[derive(Debug, clap::Args)]
 pub struct Storage {
-    /// Directory holding the NAR tree and the index database.
+    /// Directory holding the NAR tree, the published records, and the receipts.
     #[arg(long, env = "BINCACHE_DATA_DIR")]
     pub data_dir: std::path::PathBuf,
 }

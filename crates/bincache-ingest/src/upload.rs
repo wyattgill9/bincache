@@ -152,7 +152,7 @@ impl Upload<Receiving> {
 
         let tail = encoder.finish().context(CompressSnafu)?;
         file.update(&tail);
-        self.staged.write(bytes::Bytes::from(tail)).await.context(StageSnafu)?;
+        self.staged.write(&tail).await.context(StageSnafu)?;
 
         let state = Compressed {
             nar_hash: nar.finish(),
@@ -170,7 +170,7 @@ impl Upload<Receiving> {
             return Ok(());
         }
         self.state.file.update(&produced);
-        self.staged.write(bytes::Bytes::from(produced)).await.context(StageSnafu)
+        self.staged.write(&produced).await.context(StageSnafu)
     }
 }
 
@@ -262,7 +262,7 @@ mod tests {
         upload.finish().await.expect("finishes")
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn stores_and_records_a_verified_upload() {
         let harness = harness("verified").await;
         let body = b"nix-archive-1 pretend this is a real NAR".repeat(64);
@@ -286,7 +286,7 @@ mod tests {
 
     /// The stored artifact must decompress back to exactly what was uploaded, which is the
     /// property a client checks after it downloads.
-    #[compio::test]
+    #[tokio::test]
     async fn the_stored_artifact_decompresses_to_the_uploaded_bytes() {
         let harness = harness("roundtrip").await;
         let body = b"nix-archive-1(type,regular,contents,".repeat(500);
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(entry.file_hash, bincache_core::hash::Sha256::digest(&compressed));
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn a_hash_mismatch_aborts_before_anything_durable_exists() {
         let harness = harness("mismatch").await;
         let body = b"the body that actually arrived";
@@ -322,7 +322,7 @@ mod tests {
         assert!(harness.index.nar(&declared).expect("reads").is_none());
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn an_empty_upload_is_refused() {
         let harness = harness("empty").await;
         let nar_hash = bincache_core::hash::Sha256::digest(b"");
@@ -330,7 +330,7 @@ mod tests {
         assert!(matches!(upload.verify(), Err(crate::upload::Error::Empty)));
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn an_aborted_upload_leaves_no_staging_file() {
         let harness = harness("aborted").await;
         let staged = harness.store.stage().await.expect("stages");
@@ -352,7 +352,7 @@ mod tests {
 
     /// Uploading the same NAR twice must be a no-op rather than a conflict: content
     /// addressing means both writers produced identical bytes.
-    #[compio::test]
+    #[tokio::test]
     async fn re_uploading_the_same_nar_is_idempotent() {
         let harness = harness("idempotent").await;
         let body = b"nix-archive-1 repeated".repeat(32);

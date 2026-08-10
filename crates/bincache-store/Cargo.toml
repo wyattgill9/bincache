@@ -7,14 +7,12 @@ publish.workspace = true
 [dependencies]
 bincache-core = { workspace = true }
 
-bytes   = { workspace = true }
-compio  = { workspace = true, features = ["fs", "io"] }
 snafu   = { workspace = true }
+tokio   = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-compio             = { workspace = true, features = ["fs", "io", "macros"] }
-pretty_assertions  = { workspace = true }
+pretty_assertions = { workspace = true }
 
 [lints]
 workspace = true

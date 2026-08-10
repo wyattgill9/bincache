@@ -9,7 +9,6 @@ bincache-core  = { workspace = true }
 bincache-index = { workspace = true }
 bincache-store = { workspace = true }
 
-bytes         = { workspace = true }
 data-encoding = { workspace = true }
 rand          = { workspace = true }
 snafu         = { workspace = true }
@@ -18,8 +17,8 @@ tracing       = { workspace = true }
 zstd          = { workspace = true }
 
 [dev-dependencies]
-compio            = { workspace = true, features = ["macros"] }
 pretty_assertions = { workspace = true }
+tokio             = { workspace = true }
 
 [lints]
 workspace = true

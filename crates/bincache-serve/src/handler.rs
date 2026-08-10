@@ -1,7 +1,7 @@
 //! What each route does, and the reasons behind the headers it sets.
 //!
-//! Two rules from `research/DESIGN_V2.md` are load-bearing on the payload plane and are
-//! asserted by conformance tests rather than left to review:
+//! Two rules are load-bearing on the payload plane and are asserted by conformance tests
+//! rather than left to review:
 //!
 //! - `Accept-Ranges: bytes` is mandatory. `maybeRetry` in `filetransfer.cc` resumes a
 //!   dropped NAR only if the first response advertised it.
@@ -9,6 +9,13 @@
 //!   answering would double-encode against the narinfo `Compression` contract *and*
 //!   silently disable resume. A dropped connection 9 GB into a 10 GB NAR would then
 //!   restart at zero, which presents as a throughput cliff and never as an error.
+//!
+//! Routing goes through [`crate::route::resolve`] under a single `fallback` rather than an
+//! axum route table. `resolve` stays the one owner of URL shape, and dispatching on the
+//! method here avoids axum's `MethodRouter`, which answers `HEAD` by running the `GET`
+//! handler and discarding the body. `HEAD /nar/<nar hash>.nar` must not do that: it is the
+//! probe a client runs before uploading, it is answered from the NAR index rather than from
+//! the filesystem, and getting it wrong makes every build node re-upload every NAR forever.
 
 use snafu::ResultExt as _;
 
@@ -21,12 +28,16 @@ const METRICS_TYPE: &str = "text/plain; version=0.0.4";
 /// Content type for a refusal body, which is one line of prose for a human.
 const REFUSAL_TYPE: &str = "text/plain; charset=utf-8";
 
+/// Announced on every response, so an operator can tell what answered.
+const SERVER: &str = "bincache";
+
+/// Ceiling on a narinfo `PUT` body. A real narinfo is around 1 KB; a megabyte is four
+/// orders of magnitude of headroom and still bounds the buffer.
+pub const METADATA_BODY_MAX: usize = 1024 * 1024;
+
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("the connection failed"))]
-    Connection { source: crate::connection::Error },
-
     #[snafu(display("the index could not be read"))]
     Index { source: bincache_index::index::Error },
 
@@ -35,6 +46,18 @@ pub enum Error {
 
     #[snafu(display("the upload failed"))]
     Upload { source: bincache_ingest::upload::Error },
+
+    #[snafu(display("the response could not be built"))]
+    Build { source: axum::http::Error },
+}
+
+/// A server fault. The pusher or reader cannot act on any of these, so the reason stays in
+/// the log and the wire gets a bare `500`.
+impl axum::response::IntoResponse for Error {
+    fn into_response(self) -> axum::response::Response {
+        tracing::error!(error = ?self, "the request could not be answered");
+        bare(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+    }
 }
 
 /// What the composition root assembles a [`Cache`] from.
@@ -42,29 +65,17 @@ pub struct Parts {
     pub ingest: bincache_ingest::ingest::Ingest,
     pub tokens: bincache_ingest::auth::Tokens,
     pub info: bincache_core::cacheinfo::CacheInfo,
-    pub stats: crate::stats::Shards,
+    pub stats: crate::stats::Stats,
 }
 
-/// Everything a shard needs to answer a request. Cheap to clone; every shard holds one.
+/// Everything a request needs to be answered. Cheap to clone; axum hands one to every task.
 #[derive(Clone)]
 pub struct Cache {
     ingest: bincache_ingest::ingest::Ingest,
     tokens: bincache_ingest::auth::Tokens,
     /// Rendered once at boot: it is a pure function of configuration.
-    info: std::sync::Arc<str>,
-    stats: crate::stats::Shards,
-}
-
-/// Whether the request's body has been read off the socket.
-///
-/// A bodyless answer to a request whose body is still in flight has to close the
-/// connection, or the next request on it would start mid-message. A request whose body was
-/// consumed keeps the connection, which is what lets `nix copy` push a whole closure over
-/// one connection instead of reconnecting per path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Drained {
-    Consumed,
-    Unread,
+    info: bytes::Bytes,
+    stats: crate::stats::Stats,
 }
 
 /// A refused push, resolved into the two things the wire needs.
@@ -72,7 +83,7 @@ enum Drained {
 /// Building this is the one place a typed ingest error becomes a string, which is why the
 /// conversion lives here and not in the crate that raised it.
 struct Refusal {
-    status: crate::http::response::Status,
+    status: axum::http::StatusCode,
     /// `None` for a server fault: the pusher cannot act on it, and the text names paths
     /// inside the data directory.
     message: Option<String>,
@@ -82,35 +93,38 @@ impl Refusal {
     fn new(fault: bincache_ingest::fault::Fault, error: &dyn core::fmt::Display) -> Self {
         match fault {
             bincache_ingest::fault::Fault::Client => Self {
-                status: crate::http::response::Status::BadRequest,
+                status: axum::http::StatusCode::BAD_REQUEST,
                 // Trailing newline so the text lands cleanly in a terminal when a client
                 // does print it.
                 message: Some(format!("{error}\n")),
             },
             bincache_ingest::fault::Fault::Server => {
-                Self { status: crate::http::response::Status::ServerError, message: None }
+                Self { status: axum::http::StatusCode::INTERNAL_SERVER_ERROR, message: None }
             }
         }
     }
-}
 
-/// One request on one connection. Bundled so the handlers below take the exchange plus at
-/// most the one decoded value their route carries.
-pub struct Exchange<'a, 'head> {
-    pub shard: usize,
-    pub connection: &'a mut crate::connection::Connection,
-    pub request: &'a crate::http::Request<'head>,
+    fn into_response(self) -> axum::response::Response {
+        let Self { status, message } = self;
+        let Some(message) = message else {
+            return bare(status);
+        };
+        match body(status, REFUSAL_TYPE, bytes::Bytes::from(message)) {
+            Ok(response) => response,
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        }
+    }
 }
 
 impl Cache {
     #[must_use]
     pub fn new(parts: Parts) -> Self {
         let Parts { ingest, tokens, info, stats } = parts;
-        Self { ingest, tokens, info: info.render().into(), stats }
+        Self { ingest, tokens, info: bytes::Bytes::from(info.render()), stats }
     }
 
     #[must_use]
-    pub const fn stats(&self) -> &crate::stats::Shards {
+    pub const fn stats(&self) -> &crate::stats::Stats {
         &self.stats
     }
 
@@ -118,417 +132,321 @@ impl Cache {
     pub const fn ingest(&self) -> &bincache_ingest::ingest::Ingest {
         &self.ingest
     }
+}
 
-    /// Answers one request. The returned value decides whether the connection survives.
-    pub async fn handle(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        crate::stats::Shard::bump(&self.stats.get(exchange.shard).requests, 1);
+/// The whole protocol surface, behind one dispatcher. See the module doc for why this is a
+/// `fallback` rather than a route table.
+pub fn router(cache: Cache) -> axum::Router {
+    axum::Router::new()
+        // A NAR is multi-gigabyte and is bounded by the declared `Content-Length` that
+        // hyper enforces, plus the hash check that gates anything durable. The narinfo
+        // route applies its own, much smaller, ceiling.
+        .fallback(dispatch)
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .with_state(cache)
+}
 
-        if exchange.request.framing == crate::http::Framing::Chunked {
-            return self
-                .answer(exchange, crate::http::response::Status::NotImplemented, Drained::Unread)
-                .await;
+async fn dispatch(
+    axum::extract::State(cache): axum::extract::State<Cache>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    cache.stats.request();
+    let (parts, body) = request.into_parts();
+
+    let route = match crate::route::resolve(parts.uri.path()) {
+        Ok(route) => route,
+        Err(crate::route::Error::Unknown { .. }) => {
+            return bare(axum::http::StatusCode::NOT_FOUND);
         }
-
-        let route = match crate::route::resolve(exchange.request.target) {
-            Ok(route) => route,
-            Err(crate::route::Error::Unknown { .. }) => {
-                return self
-                    .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
-                    .await;
-            }
-            Err(error) => {
-                tracing::debug!(
-                    target = exchange.request.target,
-                    error = ?error,
-                    "unroutable request"
-                );
-                return self
-                    .answer(exchange, crate::http::response::Status::BadRequest, Drained::Unread)
-                    .await;
-            }
-        };
-
-        match route {
-            crate::route::Route::CacheInfo => self.cache_info(exchange).await,
-            crate::route::Route::Metrics => self.metrics(exchange).await,
-            crate::route::Route::Narinfo(key) => self.narinfo(exchange, key).await,
-            crate::route::Route::Nar(url) => self.nar(exchange, &url).await,
+        Err(error) => {
+            tracing::debug!(target = %parts.uri, error = ?error, "unroutable request");
+            return bare(axum::http::StatusCode::BAD_REQUEST);
         }
+    };
+
+    let answered = match route {
+        crate::route::Route::CacheInfo => cache_info(&cache),
+        crate::route::Route::Metrics => metrics(&cache),
+        crate::route::Route::Narinfo(key) => narinfo(&cache, &parts, body, key).await,
+        crate::route::Route::Nar(url) => nar(&cache, &parts, body, &url).await,
+    };
+    match answered {
+        Ok(response) => response,
+        Err(error) => axum::response::IntoResponse::into_response(error),
+    }
+}
+
+fn cache_info(cache: &Cache) -> Result<axum::response::Response, Error> {
+    body(axum::http::StatusCode::OK, CACHE_INFO_TYPE, cache.info.clone())
+}
+
+fn metrics(cache: &Cache) -> Result<axum::response::Response, Error> {
+    let paths = cache.ingest.index().count().context(IndexSnafu)?;
+    let rendered = cache.stats.total().render(paths);
+    body(axum::http::StatusCode::OK, METRICS_TYPE, bytes::Bytes::from(rendered))
+}
+
+/// `GET` and `HEAD` render the same body; hyper suppresses the bytes for `HEAD` and keeps
+/// the length, which is the whole reason the stored artifact is a body rather than a framed
+/// response.
+async fn narinfo(
+    cache: &Cache,
+    parts: &axum::http::request::Parts,
+    request: axum::body::Body,
+    key: bincache_core::storepath::Hash,
+) -> Result<axum::response::Response, Error> {
+    if parts.method == axum::http::Method::PUT {
+        return publish(cache, parts, request).await;
     }
 
-    async fn cache_info(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let mut head = crate::http::response::Head::new(
-            crate::http::response::Status::Ok,
-            exchange.request.keep_alive,
+    let Some(record) = cache.ingest.index().narinfo(&key).context(IndexSnafu)? else {
+        cache.stats.metadata_miss();
+        return Ok(bare(axum::http::StatusCode::NOT_FOUND));
+    };
+    cache.stats.metadata_hit();
+
+    let rendered = record.render(cache.ingest.dir());
+    body(
+        axum::http::StatusCode::OK,
+        bincache_core::narinfo::CONTENT_TYPE,
+        bytes::Bytes::from(rendered),
+    )
+}
+
+async fn nar(
+    cache: &Cache,
+    parts: &axum::http::request::Parts,
+    request: axum::body::Body,
+    url: &bincache_core::narurl::NarUrl,
+) -> Result<axum::response::Response, Error> {
+    match parts.method {
+        axum::http::Method::PUT => receive(cache, parts, request, url).await,
+        axum::http::Method::HEAD => probe(cache, url).await,
+        _ => stream(cache, parts, url).await,
+    }
+}
+
+/// The existence check `BinaryCacheStore::addToStore` runs before it uploads.
+///
+/// A client that compressed nothing asks about `nar/<nar hash>.nar`, but bincache
+/// recompresses on receipt and stores the result under a different name, so this is
+/// answered from the NAR-hash index rather than from the filesystem. Answering `404`
+/// here would make every build node re-upload every NAR forever.
+async fn probe(
+    cache: &Cache,
+    url: &bincache_core::narurl::NarUrl,
+) -> Result<axum::response::Response, Error> {
+    let length = if url.compression == bincache_core::compression::Compression::None {
+        cache
+            .ingest
+            .index()
+            .nar(&url.file_hash)
+            .context(IndexSnafu)?
+            .map(|entry| entry.nar_size.get())
+    } else {
+        let reader = cache.ingest.store().read(url).await.context(StoreSnafu)?;
+        reader.map(|reader| reader.size())
+    };
+
+    let Some(length) = length else {
+        return Ok(bare(axum::http::StatusCode::NOT_FOUND));
+    };
+
+    // Length without a body: this route is only reached for `HEAD`, and the point of the
+    // probe is to answer without opening the artifact at all.
+    head(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, bincache_core::narurl::CONTENT_TYPE)
+        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+        .header(axum::http::header::CONTENT_LENGTH, length)
+        .body(axum::body::Body::empty())
+        .context(BuildSnafu)
+}
+
+async fn stream(
+    cache: &Cache,
+    parts: &axum::http::request::Parts,
+    url: &bincache_core::narurl::NarUrl,
+) -> Result<axum::response::Response, Error> {
+    let Some(reader) = cache.ingest.store().read(url).await.context(StoreSnafu)? else {
+        return Ok(bare(axum::http::StatusCode::NOT_FOUND));
+    };
+    let size = reader.size();
+    if size == 0 {
+        // Ingest refuses an empty NAR, so a zero-length artifact means a truncated file
+        // on disk rather than something a client did.
+        tracing::error!(name = url.name(), "artifact on disk is empty");
+        return Ok(bare(axum::http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    let requested = crate::range::resolve(range_header(parts), size);
+    let span = match requested {
+        crate::range::Requested::Whole => crate::range::Span { first: 0, last: size - 1 },
+        crate::range::Requested::Partial(span) => span,
+        crate::range::Requested::Unsatisfiable => {
+            return head(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(axum::http::header::CONTENT_RANGE, format!("bytes */{size}"))
+                .header(axum::http::header::ACCEPT_RANGES, "bytes")
+                .header(axum::http::header::CONTENT_LENGTH, 0)
+                .body(axum::body::Body::empty())
+                .context(BuildSnafu);
+        }
+    };
+
+    let partial = span.len() != size;
+    let status =
+        if partial { axum::http::StatusCode::PARTIAL_CONTENT } else { axum::http::StatusCode::OK };
+
+    let mut response = head(status)
+        .header(axum::http::header::CONTENT_TYPE, bincache_core::narurl::CONTENT_TYPE)
+        .header(axum::http::header::ACCEPT_RANGES, "bytes")
+        .header(axum::http::header::CONTENT_LENGTH, span.len());
+    if partial {
+        response = response.header(
+            axum::http::header::CONTENT_RANGE,
+            format!("bytes {}-{}/{size}", span.first, span.last),
         );
-        head.header("Content-Type", CACHE_INFO_TYPE);
-        let info = std::sync::Arc::clone(&self.info);
-        self.send(exchange, head, info.as_bytes()).await
     }
 
-    async fn metrics(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let paths = self.ingest.index().count().context(IndexSnafu)?;
-        let body = self.stats.total().render(self.stats.len(), paths);
-        let mut head = crate::http::response::Head::new(
-            crate::http::response::Status::Ok,
-            exchange.request.keep_alive,
-        );
-        head.header("Content-Type", METRICS_TYPE);
-        self.send(exchange, head, body.as_bytes()).await
+    let file = reader.seek(span.first).await.context(StoreSnafu)?;
+    let bounded = tokio::io::AsyncReadExt::take(file, span.len());
+    let payload = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(bounded));
+
+    cache.stats.payload(span.len());
+    response.body(payload).context(BuildSnafu)
+}
+
+/// `PUT nar/<nar hash>.nar`, the payload half of a push.
+async fn receive(
+    cache: &Cache,
+    parts: &axum::http::request::Parts,
+    request: axum::body::Body,
+    url: &bincache_core::narurl::NarUrl,
+) -> Result<axum::response::Response, Error> {
+    if admit(cache, parts) == bincache_ingest::auth::Admission::Denied {
+        return Ok(bare(axum::http::StatusCode::UNAUTHORIZED));
     }
 
-    /// `GET` and `HEAD` render the same body; `HEAD` reuses its length and writes no body,
-    /// which is the whole reason the stored artifact is a body rather than a framed
-    /// response.
-    async fn narinfo(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        key: bincache_core::storepath::Hash,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        if exchange.request.method == crate::http::Method::Put {
-            return self.publish(exchange).await;
+    let mut upload = match cache.ingest.receive(url).await {
+        Ok(upload) => upload,
+        Err(error) => {
+            tracing::warn!(error = ?error, "refused an upload");
+            return Ok(Refusal::new(error.fault(), &error).into_response());
         }
+    };
 
-        let stats = self.stats.get(exchange.shard);
-        let Some(record) = self.ingest.index().narinfo(&key).context(IndexSnafu)? else {
-            crate::stats::Shard::bump(&stats.metadata_misses, 1);
-            return self
-                .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
-                .await;
+    let mut chunks = request.into_data_stream();
+    loop {
+        let next = futures_util::StreamExt::next(&mut chunks).await;
+        let Some(chunk) = next else {
+            break;
         };
-        crate::stats::Shard::bump(&stats.metadata_hits, 1);
-
-        let body = record.render(self.ingest.dir());
-        let mut head = crate::http::response::Head::new(
-            crate::http::response::Status::Ok,
-            exchange.request.keep_alive,
-        );
-        head.header("Content-Type", bincache_core::narinfo::CONTENT_TYPE);
-        self.send(exchange, head, body.as_bytes()).await
+        let Ok(chunk) = chunk else {
+            // The peer vanished or framed its body badly. Dropping `upload` unlinks the
+            // staging file, so nothing durable was ever named after these bytes.
+            tracing::debug!("an upload ended before its body did");
+            return Ok(bare(axum::http::StatusCode::BAD_REQUEST));
+        };
+        upload.write(&chunk).await.context(UploadSnafu)?;
     }
 
-    async fn nar(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        url: &bincache_core::narurl::NarUrl,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        match exchange.request.method {
-            crate::http::Method::Put => self.receive(exchange, url).await,
-            crate::http::Method::Head => self.probe(exchange, url).await,
-            crate::http::Method::Get => self.stream(exchange, url).await,
+    let compressed = upload.finish().await.context(UploadSnafu)?;
+    let verified = match compressed.verify() {
+        Ok(verified) => verified,
+        Err(error) => {
+            // The staging file goes away with the dropped upload; nothing durable
+            // was ever named after unverified content.
+            tracing::warn!(error = ?error, "upload failed verification");
+            return Ok(Refusal::new(error.fault(), &error).into_response());
         }
+    };
+    verified.store(cache.ingest.store(), cache.ingest.index()).await.context(UploadSnafu)?;
+
+    cache.stats.upload();
+    Ok(bare(axum::http::StatusCode::CREATED))
+}
+
+/// `PUT <hash>.narinfo`, the metadata half of a push, and the publish.
+async fn publish(
+    cache: &Cache,
+    parts: &axum::http::request::Parts,
+    request: axum::body::Body,
+) -> Result<axum::response::Response, Error> {
+    if admit(cache, parts) == bincache_ingest::auth::Admission::Denied {
+        return Ok(bare(axum::http::StatusCode::UNAUTHORIZED));
+    }
+    if declared_length(parts).is_some_and(|length| length > METADATA_BODY_MAX) {
+        return Ok(bare(axum::http::StatusCode::PAYLOAD_TOO_LARGE));
     }
 
-    /// The existence check `BinaryCacheStore::addToStore` runs before it uploads.
-    ///
-    /// A client that compressed nothing asks about `nar/<nar hash>.nar`, but bincache
-    /// recompresses on receipt and stores the result under a different name, so this is
-    /// answered from the NAR-hash index rather than from the filesystem. Answering `404`
-    /// here would make every build node re-upload every NAR forever.
-    async fn probe(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        url: &bincache_core::narurl::NarUrl,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let length = if url.compression == bincache_core::compression::Compression::None {
-            self.ingest
-                .index()
-                .nar(&url.file_hash)
-                .context(IndexSnafu)?
-                .map(|entry| entry.nar_size.get())
-        } else {
-            let reader = self.ingest.store().read(url).await.context(StoreSnafu)?;
-            reader.map(|reader| reader.size())
-        };
+    let Ok(collected) = axum::body::to_bytes(request, METADATA_BODY_MAX).await else {
+        return Ok(bare(axum::http::StatusCode::BAD_REQUEST));
+    };
+    let Ok(text) = String::from_utf8(collected.into()) else {
+        return Ok(bare(axum::http::StatusCode::BAD_REQUEST));
+    };
 
-        let Some(length) = length else {
-            return self
-                .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
-                .await;
-        };
-        let mut head = crate::http::response::Head::new(
-            crate::http::response::Status::Ok,
-            exchange.request.keep_alive,
-        );
-        head.header("Content-Type", bincache_core::narurl::CONTENT_TYPE);
-        head.header("Accept-Ranges", "bytes");
-        head.length(length);
-        exchange.connection.write(head.finish()).await.context(ConnectionSnafu)?;
-        Ok(exchange.request.keep_alive)
+    if let Err(error) = cache.ingest.publish(&text) {
+        tracing::warn!(error = ?error, "refused a narinfo");
+        return Ok(Refusal::new(error.fault(), &error).into_response());
     }
+    Ok(bare(axum::http::StatusCode::CREATED))
+}
 
-    async fn stream(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        url: &bincache_core::narurl::NarUrl,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let Some(reader) = self.ingest.store().read(url).await.context(StoreSnafu)? else {
-            return self
-                .answer(exchange, crate::http::response::Status::NotFound, Drained::Unread)
-                .await;
-        };
-        let size = reader.size();
-        if size == 0 {
-            // Ingest refuses an empty NAR, so a zero-length artifact means a truncated file
-            // on disk rather than something a client did.
-            tracing::error!(name = url.name(), "artifact on disk is empty");
-            return self
-                .answer(exchange, crate::http::response::Status::ServerError, Drained::Unread)
-                .await;
-        }
-
-        let span = match crate::range::resolve(exchange.request.range, size) {
-            crate::range::Requested::Whole => crate::range::Span { first: 0, last: size - 1 },
-            crate::range::Requested::Partial(span) => span,
-            crate::range::Requested::Unsatisfiable => {
-                let mut head = crate::http::response::Head::new(
-                    crate::http::response::Status::RangeNotSatisfiable,
-                    exchange.request.keep_alive,
-                );
-                head.header("Content-Range", format!("bytes */{size}"));
-                head.header("Accept-Ranges", "bytes");
-                head.length(0);
-                exchange.connection.write(head.finish()).await.context(ConnectionSnafu)?;
-                return Ok(exchange.request.keep_alive);
-            }
-        };
-        let partial = span.len() != size;
-
-        let status = if partial {
-            crate::http::response::Status::PartialContent
-        } else {
-            crate::http::response::Status::Ok
-        };
-        let mut head = crate::http::response::Head::new(status, exchange.request.keep_alive);
-        head.header("Content-Type", bincache_core::narurl::CONTENT_TYPE);
-        head.header("Accept-Ranges", "bytes");
-        if partial {
-            head.header("Content-Range", format!("bytes {}-{}/{size}", span.first, span.last));
-        }
-        head.length(span.len());
-        exchange.connection.write(head.finish()).await.context(ConnectionSnafu)?;
-
-        let sent = self.pump(exchange, &reader, span).await?;
-        crate::stats::Shard::bump(&self.stats.get(exchange.shard).payload_bytes, sent);
-        Ok(exchange.request.keep_alive)
+fn admit(cache: &Cache, parts: &axum::http::request::Parts) -> bincache_ingest::auth::Admission {
+    let admission = parts
+        .headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bincache_ingest::auth::credential)
+        .map_or(bincache_ingest::auth::Admission::Denied, |token| cache.tokens.admits(&token));
+    if admission == bincache_ingest::auth::Admission::Denied {
+        cache.stats.rejection();
     }
+    admission
+}
 
-    /// Bounded sends with the shard handed back between chunks, so one multi-gigabyte NAR
-    /// cannot starve the metadata requests sharing its shard.
-    ///
-    /// One buffer serves the whole stream: it travels into the read, out of the write, and
-    /// back, so a gigabyte transfer allocates once.
-    async fn pump(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        reader: &bincache_store::nar::Reader,
-        span: crate::range::Span,
-    ) -> Result<u64, Error> {
-        let mut offset = span.first;
-        let mut buffer = Vec::with_capacity(crate::connection::SEND_CHUNK);
-        while offset <= span.last {
-            let wanted = core::cmp::min(
-                span.last - offset + 1,
-                u64::try_from(crate::connection::SEND_CHUNK).unwrap_or(u64::MAX),
-            );
-            buffer.clear();
+fn range_header(parts: &axum::http::request::Parts) -> Option<&str> {
+    parts.headers.get(axum::http::header::RANGE).and_then(|value| value.to_str().ok())
+}
 
-            let (read, mut filled) = reader.read_at(buffer, offset).await.context(StoreSnafu)?;
-            if read == 0 {
-                tracing::error!(offset, "artifact ended before its recorded length");
-                return Ok(offset - span.first);
-            }
-            filled.truncate(usize::try_from(wanted).unwrap_or(read));
-            let sent = u64::try_from(filled.len()).unwrap_or(0);
+fn declared_length(parts: &axum::http::request::Parts) -> Option<usize> {
+    parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+}
 
-            buffer = exchange.connection.write(filled).await.context(ConnectionSnafu)?;
-            offset += sent;
-            crate::connection::yield_now().await;
+/// A response head under construction, carrying the fields every answer sets.
+fn head(status: axum::http::StatusCode) -> axum::http::response::Builder {
+    axum::http::Response::builder().status(status).header(axum::http::header::SERVER, SERVER)
+}
+
+/// A response with a body. hyper suppresses the bytes for a `HEAD` request and keeps the
+/// length it computed, so callers do not special-case the method.
+fn body(
+    status: axum::http::StatusCode,
+    content_type: &str,
+    payload: bytes::Bytes,
+) -> Result<axum::response::Response, Error> {
+    head(status)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .header(axum::http::header::CONTENT_LENGTH, payload.len())
+        .body(axum::body::Body::from(payload))
+        .context(BuildSnafu)
+}
+
+/// A bodyless answer: an error status, or a miss.
+fn bare(status: axum::http::StatusCode) -> axum::response::Response {
+    let built =
+        head(status).header(axum::http::header::CONTENT_LENGTH, 0).body(axum::body::Body::empty());
+    match built {
+        Ok(response) => response,
+        // Unreachable: every header above is a constant. Answering rather than panicking
+        // keeps a serving path free of `unwrap`.
+        Err(error) => {
+            tracing::error!(error = ?error, "a constant response head failed to build");
+            axum::http::Response::new(axum::body::Body::empty())
         }
-        Ok(span.len())
-    }
-
-    /// `PUT nar/<nar hash>.nar`, the payload half of a push.
-    async fn receive(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        url: &bincache_core::narurl::NarUrl,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        if self.admit(exchange.shard, exchange.request) == bincache_ingest::auth::Admission::Denied
-        {
-            return self
-                .answer(exchange, crate::http::response::Status::Unauthorized, Drained::Unread)
-                .await;
-        }
-        let crate::http::Framing::Length(mut remaining) = exchange.request.framing else {
-            return self
-                .answer(exchange, crate::http::response::Status::LengthRequired, Drained::Unread)
-                .await;
-        };
-
-        let mut upload = match self.ingest.receive(url).await {
-            Ok(upload) => upload,
-            Err(error) => {
-                tracing::warn!(error = ?error, "refused an upload");
-                let refusal = Refusal::new(error.fault(), &error);
-                return self.refuse(exchange, refusal, Drained::Unread).await;
-            }
-        };
-        self.proceed(exchange).await?;
-
-        while remaining > 0 {
-            let chunk = exchange.connection.chunk(&mut remaining).await.context(ConnectionSnafu)?;
-            if chunk.is_empty() {
-                break;
-            }
-            upload.write(&chunk).await.context(UploadSnafu)?;
-            crate::connection::yield_now().await;
-        }
-
-        let compressed = upload.finish().await.context(UploadSnafu)?;
-        let verified = match compressed.verify() {
-            Ok(verified) => verified,
-            Err(error) => {
-                // The staging file goes away with the dropped upload; nothing durable
-                // was ever named after unverified bytes.
-                tracing::warn!(error = ?error, "upload failed verification");
-                let refusal = Refusal::new(error.fault(), &error);
-                return self.refuse(exchange, refusal, Drained::Consumed).await;
-            }
-        };
-        verified.store(self.ingest.store(), self.ingest.index()).await.context(UploadSnafu)?;
-
-        crate::stats::Shard::bump(&self.stats.get(exchange.shard).uploads, 1);
-        self.answer(exchange, crate::http::response::Status::Created, Drained::Consumed).await
-    }
-
-    /// `PUT <hash>.narinfo`, the metadata half of a push, and the publish.
-    async fn publish(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        if self.admit(exchange.shard, exchange.request) == bincache_ingest::auth::Admission::Denied
-        {
-            return self
-                .answer(exchange, crate::http::response::Status::Unauthorized, Drained::Unread)
-                .await;
-        }
-        let crate::http::Framing::Length(length) = exchange.request.framing else {
-            return self
-                .answer(exchange, crate::http::response::Status::LengthRequired, Drained::Unread)
-                .await;
-        };
-        if length > crate::http::METADATA_BODY_MAX {
-            return self
-                .answer(exchange, crate::http::response::Status::ContentTooLarge, Drained::Unread)
-                .await;
-        }
-        self.proceed(exchange).await?;
-
-        let body = exchange.connection.body(length).await.context(ConnectionSnafu)?;
-        let Ok(text) = String::from_utf8(body) else {
-            return self
-                .answer(exchange, crate::http::response::Status::BadRequest, Drained::Consumed)
-                .await;
-        };
-        if let Err(error) = self.ingest.publish(&text) {
-            tracing::warn!(error = ?error, "refused a narinfo");
-            let refusal = Refusal::new(error.fault(), &error);
-            return self.refuse(exchange, refusal, Drained::Consumed).await;
-        }
-        self.answer(exchange, crate::http::response::Status::Created, Drained::Consumed).await
-    }
-
-    /// Answers `Expect: 100-continue` once the request is known to be acceptable. curl sets
-    /// it on uploads past about a kilobyte and stalls for a second if nothing answers.
-    async fn proceed(&self, exchange: &mut Exchange<'_, '_>) -> Result<(), Error> {
-        if exchange.request.expectation == crate::http::Expectation::Continue {
-            let status = crate::http::response::Status::Continue;
-            let head =
-                format!("HTTP/1.1 {} {}\r\n\r\n", status.code(), status.reason()).into_bytes();
-            exchange.connection.write(head).await.context(ConnectionSnafu)?;
-        }
-        Ok(())
-    }
-
-    fn admit(
-        &self,
-        shard: usize,
-        request: &crate::http::Request<'_>,
-    ) -> bincache_ingest::auth::Admission {
-        let admission = request
-            .authorization
-            .and_then(bincache_ingest::auth::credential)
-            .map_or(bincache_ingest::auth::Admission::Denied, |token| self.tokens.admits(&token));
-        if admission == bincache_ingest::auth::Admission::Denied {
-            crate::stats::Shard::bump(&self.stats.get(shard).rejections, 1);
-        }
-        admission
-    }
-
-    /// A bodyless answer.
-    async fn answer(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        status: crate::http::response::Status,
-        drained: Drained,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let unread = drained == Drained::Unread && exchange.request.body_len() > 0;
-        let keep_alive =
-            if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
-        let head = crate::http::response::bare(status, keep_alive, 0);
-        exchange.connection.write(head).await.context(ConnectionSnafu)?;
-        Ok(keep_alive)
-    }
-
-    /// A refusal, carrying its reason when the reason is the client's to act on.
-    ///
-    /// A `PUT` whose body was never read still gets the message before the connection
-    /// closes, which is the case that matters: the largest refusal is a pre-compressed NAR,
-    /// and answering it early is the whole point of not reading the upload first.
-    async fn refuse(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        refusal: Refusal,
-        drained: Drained,
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let Refusal { status, message } = refusal;
-        let Some(message) = message else {
-            return self.answer(exchange, status, drained).await;
-        };
-
-        let unread = drained == Drained::Unread && exchange.request.body_len() > 0;
-        let keep_alive =
-            if unread { crate::http::KeepAlive::Close } else { exchange.request.keep_alive };
-        let mut head = crate::http::response::Head::new(status, keep_alive);
-        head.header("Content-Type", REFUSAL_TYPE);
-        let bytes = head.with_body(message.as_bytes());
-        exchange.connection.write(bytes).await.context(ConnectionSnafu)?;
-        Ok(keep_alive)
-    }
-
-    async fn send(
-        &self,
-        exchange: &mut Exchange<'_, '_>,
-        mut head: crate::http::response::Head,
-        body: &[u8],
-    ) -> Result<crate::http::KeepAlive, Error> {
-        let bytes = if exchange.request.method == crate::http::Method::Head {
-            head.length(u64::try_from(body.len()).unwrap_or(u64::MAX));
-            head.finish()
-        } else {
-            head.with_body(body)
-        };
-        exchange.connection.write(bytes).await.context(ConnectionSnafu)?;
-        Ok(exchange.request.keep_alive)
     }
 }

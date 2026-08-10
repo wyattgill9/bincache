@@ -8,16 +8,18 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+# `http1` is the whole protocol surface a Nix client speaks; `tokio` brings `axum::serve`.
+# Nothing here wants JSON, forms, or query extraction.
+axum            = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytes           = { version = "1.12" }
 clap            = { version = "4.6", features = ["derive", "env"] }
-compio          = { version = "0.19", features = ["macros", "runtime"] }
-core_affinity   = { version = "0.8" }
-crossbeam-utils = { version = "0.8" }
 data-encoding   = { version = "2.9" }
-mimalloc        = { version = "0.1" }
 derive_more     = { version = "2.1", features = ["as_ref", "display", "from"] }
 ed25519-dalek   = { version = "3.0", features = ["rand_core"] }
 expect-test     = { version = "1.5" }
+# `StreamExt::next`, for draining an upload body frame by frame. Already in the tree under
+# axum and tower; named here so the use is declared rather than incidental.
+futures-util    = { version = "0.3", default-features = false }
 rand            = { version = "0.9" }
 redb            = { version = "4.1" }
 # `unaligned` so an archive can be validated straight out of a `redb` value, which hands
@@ -26,10 +28,12 @@ redb            = { version = "4.1" }
 rkyv            = { version = "0.8", features = ["unaligned", "little_endian"] }
 sha2            = { version = "0.11" }
 snafu           = { version = "0.9" }
-socket2         = { version = "0.6" }
 strum           = { version = "0.28", features = ["derive"] }
 subtle          = { version = "2.6" }
 swrite          = { version = "0.1" }
+tokio           = { version = "1.53", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+# `io` for `ReaderStream`, which turns an open artifact into a response body.
+tokio-util      = { version = "0.7", default-features = false, features = ["io"] }
 tracing         = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zstd            = { version = "0.13" }
@@ -43,8 +47,8 @@ bincache-serve  = { path = "crates/bincache-serve" }
 bincache-store  = { path = "crates/bincache-store" }
 
 [workspace.lints.rust]
-# deny (not forbid) so the buffer-pool and index crates can carve out
-# `#![allow(unsafe_code)]` at the module that needs it (DESIGN_V2.md).
+# Nothing in this workspace writes unsafe. Kept at `deny` rather than `forbid` only so a
+# future module can carve out an exception deliberately, in the open, at that module.
 unsafe_code = "deny"
 
 [workspace.lints.clippy]

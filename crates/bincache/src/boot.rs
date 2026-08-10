@@ -1,5 +1,5 @@
 //! The composition root: open the two durable artifacts, build the shared handles once,
-//! and hand them to the shards.
+//! and hand them to the server.
 //!
 //! Boot is deliberately short. There is no snapshot to validate, no log to replay, and no
 //! O(n) filesystem rescan, because `redb` owns crash consistency and a commit is the
@@ -17,7 +17,7 @@ const INDEX: &str = "index.redb";
 #[derive(Debug, snafu::Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("starting the boot runtime failed"))]
+    #[snafu(display("starting the runtime failed"))]
     Runtime { source: std::io::Error },
 
     #[snafu(display("reading {} failed", path.display()))]
@@ -39,9 +39,6 @@ pub enum Error {
     ))]
     ZstdLevel { level: i32 },
 
-    #[snafu(display("the machine reported no available parallelism"))]
-    Parallelism { source: std::io::Error },
-
     #[snafu(display("the payload directory could not be opened"))]
     Store { source: bincache_store::nar::Error },
 
@@ -58,39 +55,36 @@ pub enum Error {
     #[snafu(display("a maintenance operation failed"))]
     Maintain { source: bincache_ingest::maintain::Error },
 
-    #[snafu(display("the serving shards failed"))]
-    Serve { source: bincache_serve::shard::Error },
+    #[snafu(display("the server failed"))]
+    Serve { source: bincache_serve::serve::Error },
 }
 
 pub fn run(args: crate::args::Args) -> Result<(), Error> {
     match args.command {
-        crate::args::Command::Serve(serve) => self::serve(*serve),
+        crate::args::Command::Serve(serve) => runtime()?.block_on(self::serve(*serve)),
         crate::args::Command::Keygen(keygen) => self::keygen(&keygen.name),
         crate::args::Command::Token => {
             println!("{}", bincache_ingest::auth::generate());
             Ok(())
         }
-        crate::args::Command::Delete(delete) => self::delete(delete),
-        crate::args::Command::Reconcile(storage) => self::reconcile(storage),
-        crate::args::Command::Rotate(rotate) => self::rotate(rotate),
+        crate::args::Command::Delete(delete) => runtime()?.block_on(self::delete(delete)),
+        crate::args::Command::Reconcile(storage) => runtime()?.block_on(self::reconcile(storage)),
+        crate::args::Command::Rotate(rotate) => runtime()?.block_on(self::rotate(rotate)),
     }
 }
 
-fn serve(args: crate::args::Serve) -> Result<(), Error> {
+fn runtime() -> Result<tokio::runtime::Runtime, Error> {
+    tokio::runtime::Runtime::new().context(RuntimeSnafu)
+}
+
+async fn serve(args: crate::args::Serve) -> Result<(), Error> {
     let store_dir = dir(&args.store)?;
     let key = secret_key(&args.secret_key_file)?;
     let level = bincache_ingest::upload::Level::new(args.zstd_level)
         .context(ZstdLevelSnafu { level: args.zstd_level })?;
-    let shards = match args.shards {
-        Some(shards) => shards,
-        None => std::thread::available_parallelism().context(ParallelismSnafu)?,
-    };
 
-    let artifacts = open(&args.storage)?;
-    let swept = compio::runtime::Runtime::new()
-        .context(RuntimeSnafu)?
-        .block_on(artifacts.store.sweep_staging())
-        .context(StoreSnafu)?;
+    let artifacts = open(&args.storage).await?;
+    let swept = artifacts.store.sweep_staging().await.context(StoreSnafu)?;
     if swept > 0 {
         tracing::warn!(swept, "removed staging files a previous run left behind");
     }
@@ -101,7 +95,6 @@ fn serve(args: crate::args::Serve) -> Result<(), Error> {
     }
     tracing::info!(
         paths = artifacts.index.count().context(IndexSnafu)?,
-        shards = shards.get(),
         %store_dir,
         public_key = %key.public().render(),
         "bincache starting"
@@ -115,7 +108,6 @@ fn serve(args: crate::args::Serve) -> Result<(), Error> {
         level,
     });
 
-    let stats = bincache_serve::stats::Shards::new(shards);
     let cache = bincache_serve::handler::Cache::new(bincache_serve::handler::Parts {
         ingest,
         tokens,
@@ -128,24 +120,10 @@ fn serve(args: crate::args::Serve) -> Result<(), Error> {
             },
             priority: bincache_core::cacheinfo::Priority(args.priority),
         },
-        stats: stats.clone(),
+        stats: bincache_serve::stats::Stats::default(),
     });
 
-    crate::watchdog::spawn(stats, core::time::Duration::from_secs(args.stall_seconds));
-
-    bincache_serve::shard::run(
-        bincache_serve::shard::Config {
-            address: args.listen,
-            shards,
-            pinning: if args.pin {
-                bincache_serve::shard::Pinning::Pinned
-            } else {
-                bincache_serve::shard::Pinning::Unpinned
-            },
-        },
-        cache,
-    )
-    .context(ServeSnafu)
+    bincache_serve::serve::run(args.listen, cache).await.context(ServeSnafu)
 }
 
 fn keygen(name: &str) -> Result<(), Error> {
@@ -157,7 +135,7 @@ fn keygen(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn delete(args: crate::args::Delete) -> Result<(), Error> {
+async fn delete(args: crate::args::Delete) -> Result<(), Error> {
     // Accept either the bare hash or a whole store path, since both are things an operator
     // has in front of them.
     let text = args.path.rsplit('/').next().unwrap_or(&args.path);
@@ -165,17 +143,16 @@ fn delete(args: crate::args::Delete) -> Result<(), Error> {
     let key = bincache_core::storepath::Hash::parse(text)
         .context(PathSnafu { path: args.path.clone() })?;
 
-    let artifacts = open(&args.storage)?;
-    let deleted = compio::runtime::Runtime::new()
-        .context(RuntimeSnafu)?
-        .block_on(bincache_ingest::maintain::delete(&artifacts.store, &artifacts.index, &key))
+    let artifacts = open(&args.storage).await?;
+    let deleted = bincache_ingest::maintain::delete(&artifacts.store, &artifacts.index, &key)
+        .await
         .context(MaintainSnafu)?;
     println!("{key}: {deleted:?}");
     Ok(())
 }
 
-fn reconcile(storage: crate::args::Storage) -> Result<(), Error> {
-    let artifacts = open(&storage)?;
+async fn reconcile(storage: crate::args::Storage) -> Result<(), Error> {
+    let artifacts = open(&storage).await?;
     let found = bincache_ingest::maintain::reconcile(&artifacts.store, &artifacts.index)
         .context(MaintainSnafu)?;
     println!("orphan artifacts: {}", found.orphan_artifacts.len());
@@ -193,9 +170,9 @@ fn reconcile(storage: crate::args::Storage) -> Result<(), Error> {
     Ok(())
 }
 
-fn rotate(args: crate::args::Rotate) -> Result<(), Error> {
+async fn rotate(args: crate::args::Rotate) -> Result<(), Error> {
     let key = secret_key(&args.secret_key_file)?;
-    let artifacts = open(&args.storage)?;
+    let artifacts = open(&args.storage).await?;
     let rotated = bincache_ingest::maintain::rotate(&artifacts.index, &dir(&args.store)?, &key)
         .context(MaintainSnafu)?;
     println!("re-signed {rotated} records under {}", key.public().render());
@@ -208,10 +185,9 @@ struct Artifacts {
     index: bincache_index::index::Index,
 }
 
-fn open(storage: &crate::args::Storage) -> Result<Artifacts, Error> {
-    let runtime = compio::runtime::Runtime::new().context(RuntimeSnafu)?;
-    let store = runtime
-        .block_on(bincache_store::nar::Store::open(storage.data_dir.join(PAYLOAD)))
+async fn open(storage: &crate::args::Storage) -> Result<Artifacts, Error> {
+    let store = bincache_store::nar::Store::open(storage.data_dir.join(PAYLOAD))
+        .await
         .context(StoreSnafu)?;
     let path = storage.data_dir.join(INDEX);
     let opened = bincache_index::index::Index::open(path.clone());

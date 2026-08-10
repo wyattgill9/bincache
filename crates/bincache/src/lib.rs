@@ -6,4 +6,3 @@
 
 pub mod args;
 pub mod boot;
-pub mod watchdog;

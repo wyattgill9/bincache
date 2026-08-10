@@ -226,7 +226,7 @@ mod tests {
             .expect("stores")
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn publishes_a_record_that_describes_what_was_stored() {
         let ingest = ingest("publish").await;
         let body = b"nix-archive-1 body".repeat(40);
@@ -243,7 +243,7 @@ mod tests {
 
     /// Managed signing: the client's own `Sig` line is discarded and replaced by one from
     /// the key that never leaves this process.
-    #[compio::test]
+    #[tokio::test]
     async fn replaces_client_signatures_with_its_own() {
         let ingest = ingest("signing").await;
         let body = b"nix-archive-1 signed".repeat(40);
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(record.sigs[0].name(), "bincache-test-1");
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn refuses_a_narinfo_whose_nar_was_never_uploaded() {
         let ingest = ingest("orphan-narinfo").await;
         let body = b"never uploaded";
@@ -264,7 +264,7 @@ mod tests {
         ));
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn refuses_a_narinfo_that_lies_about_the_nar_size() {
         let ingest = ingest("size-lie").await;
         let body = b"nix-archive-1 truthful".repeat(10);
@@ -279,7 +279,7 @@ mod tests {
         ));
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn refuses_a_pre_compressed_upload_and_names_the_fix() {
         let ingest = ingest("precompressed").await;
         let target = bincache_core::narurl::NarUrl {
@@ -294,7 +294,7 @@ mod tests {
         assert!(message.contains("?compression=none"), "message was {message:?}");
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn delete_removes_both_the_record_and_the_artifact() {
         let ingest = ingest("delete").await;
         let body = b"nix-archive-1 deletable".repeat(10);
@@ -316,7 +316,7 @@ mod tests {
         );
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn reconcile_sees_an_artifact_no_record_claims() {
         let ingest = ingest("reconcile").await;
         let body = b"nix-archive-1 unclaimed".repeat(10);
@@ -334,7 +334,7 @@ mod tests {
         assert!(reconciliation.records_without_artifacts.is_empty());
     }
 
-    #[compio::test]
+    #[tokio::test]
     async fn rotate_re_signs_every_record_verifiably() {
         let ingest = ingest("rotate").await;
         let body = b"nix-archive-1 rotatable".repeat(10);

@@ -8,9 +8,6 @@
 //! The wire is spoken directly rather than through a client library, because the point is
 //! the exact bytes.
 
-use compio::io::AsyncRead as _;
-use compio::io::AsyncWriteExt as _;
-
 /// A minimal but genuine `nix-archive-1` serialization of one regular file, so the NAR
 /// hash under test is a hash of something a client could actually have produced.
 fn nar(contents: &[u8]) -> Vec<u8> {
@@ -85,21 +82,20 @@ impl Server {
                 mass_query: bincache_core::cacheinfo::MassQuery::Wanted,
                 priority: bincache_core::cacheinfo::Priority(30),
             },
-            stats: bincache_serve::stats::Shards::new(
-                core::num::NonZeroUsize::new(1).expect("nonzero"),
-            ),
+            stats: bincache_serve::stats::Stats::default(),
         });
 
         // Port zero: the kernel picks, so parallel test binaries never collide.
-        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("binds");
         let address = listener.local_addr().expect("has an address");
-        compio::runtime::spawn(bincache_serve::shard::accept(0, listener, cache)).detach();
+        let router = bincache_serve::handler::router(cache);
+        tokio::spawn(async move { axum::serve(listener, router).await.expect("serves") });
 
         Self { address, token, key: secret.public(), dir }
     }
 
-    async fn connect(&self) -> compio::net::TcpStream {
-        compio::net::TcpStream::connect(self.address).await.expect("connects")
+    async fn connect(&self) -> tokio::net::TcpStream {
+        tokio::net::TcpStream::connect(self.address).await.expect("connects")
     }
 
     /// One request on its own connection.
@@ -117,12 +113,15 @@ impl Server {
     }
 }
 
-async fn exchange(stream: &mut compio::net::TcpStream, head: &str, body: &[u8]) -> Response {
+async fn exchange(stream: &mut tokio::net::TcpStream, head: &str, body: &[u8]) -> Response {
+    send(stream, head, body).await;
+    read_response(stream, Body::from(head)).await
+}
+
+async fn send(stream: &mut tokio::net::TcpStream, head: &str, body: &[u8]) {
     let mut request = head.as_bytes().to_vec();
     request.extend_from_slice(body);
-    let compio::BufResult(written, _) = stream.write_all(request).await;
-    written.expect("writes the request");
-    read_response(stream, Body::from(head)).await
+    tokio::io::AsyncWriteExt::write_all(stream, &request).await.expect("writes the request");
 }
 
 /// Whether a response is followed by body bytes on the wire.
@@ -144,18 +143,24 @@ impl Body {
 
 /// Reads exactly one response, using `Content-Length` for the body, which is the only
 /// framing this server ever emits.
-async fn read_response(stream: &mut compio::net::TcpStream, body: Body) -> Response {
-    let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+async fn read_response(stream: &mut tokio::net::TcpStream, body: Body) -> Response {
+    try_read_response(stream, body).await.expect("peer closed before a complete response head")
+}
+
+/// [`read_response`], but reporting a closed connection rather than asserting on it. A test
+/// that is checking whether the connection survived has to be able to see that it did not.
+async fn try_read_response(stream: &mut tokio::net::TcpStream, body: Body) -> Option<Response> {
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut scratch = [0u8; 64 * 1024];
     let head_end = loop {
         if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
             break at + 4;
         }
-        let len = buffer.len();
-        buffer.reserve(64 * 1024);
-        let compio::BufResult(read, slice) =
-            stream.read(compio::buf::IoBuf::slice(buffer, len..)).await;
-        buffer = compio::buf::IntoInner::into_inner(slice);
-        assert!(read.expect("reads") > 0, "peer closed before a complete response head");
+        let read = tokio::io::AsyncReadExt::read(stream, &mut scratch).await.expect("reads");
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&scratch[..read]);
     };
 
     let text = String::from_utf8(buffer[..head_end].to_vec()).expect("head is utf8");
@@ -184,15 +189,12 @@ async fn read_response(stream: &mut compio::net::TcpStream, body: Body) -> Respo
 
     let mut body = buffer[head_end..].to_vec();
     while body.len() < length {
-        let len = body.len();
-        body.reserve(length - len);
-        let compio::BufResult(read, slice) =
-            stream.read(compio::buf::IoBuf::slice(body, len..)).await;
-        body = compio::buf::IntoInner::into_inner(slice);
-        assert!(read.expect("reads") > 0, "peer closed before the body finished");
+        let read = tokio::io::AsyncReadExt::read(stream, &mut scratch).await.expect("reads");
+        assert!(read > 0, "peer closed before the body finished");
+        body.extend_from_slice(&scratch[..read]);
     }
     body.truncate(length);
-    Response { status, headers, body }
+    Some(Response { status, headers, body })
 }
 
 fn fields(body: &[u8]) -> std::collections::HashMap<String, Vec<String>> {
@@ -249,7 +251,7 @@ async fn publish(server: &Server, seed: &[u8]) -> Published {
     Published { path, key, nar: body, nar_hash32, narinfo }
 }
 
-#[compio::test]
+#[tokio::test]
 async fn nix_cache_info_carries_the_three_fields_a_client_reads() {
     let server = Server::start("cache-info").await;
     let response = server.request("GET /nix-cache-info HTTP/1.1\r\nHost: t\r\n\r\n", b"").await;
@@ -265,7 +267,7 @@ async fn nix_cache_info_carries_the_three_fields_a_client_reads() {
 
 /// The conformance floor from `research/DESIGN_V2.md`: `StorePath`, `NarHash`, `URL`, and a
 /// nonzero `NarSize`. Below that, `NarInfo::NarInfo` throws `corrupt` on the client.
-#[compio::test]
+#[tokio::test]
 async fn a_published_narinfo_verifies_the_way_a_client_verifies_it() {
     let server = Server::start("narinfo").await;
     let published = publish(&server, b"conformance payload").await;
@@ -300,7 +302,7 @@ async fn a_published_narinfo_verifies_the_way_a_client_verifies_it() {
         .expect("the signature verifies under the advertised public key");
 }
 
-#[compio::test]
+#[tokio::test]
 async fn head_reuses_the_body_length_and_writes_no_body() {
     let server = Server::start("head").await;
     let published = publish(&server, b"head payload").await;
@@ -318,7 +320,7 @@ async fn head_reuses_the_body_length_and_writes_no_body() {
 /// original response advertised `Accept-Ranges: bytes` *and* carried no `Content-Encoding`.
 /// Getting either wrong makes a dropped 10 GB transfer restart at zero, which presents as a
 /// throughput cliff and never as an error.
-#[compio::test]
+#[tokio::test]
 async fn a_nar_response_is_resumable() {
     let server = Server::start("resumable").await;
     let published = publish(&server, &b"payload for resume".repeat(2048)).await;
@@ -368,7 +370,7 @@ async fn a_nar_response_is_resumable() {
     );
 }
 
-#[compio::test]
+#[tokio::test]
 async fn the_served_artifact_is_what_the_client_uploaded() {
     let server = Server::start("artifact").await;
     let published = publish(&server, &b"round trip payload".repeat(1024)).await;
@@ -399,7 +401,7 @@ async fn the_served_artifact_is_what_the_client_uploaded() {
 /// `BinaryCacheStore::addToStore` HEADs the NAR URL before uploading. bincache stores a
 /// recompressed artifact under a different name, so this is answered from the NAR-hash
 /// index; a 404 would make every build node re-upload every NAR forever.
-#[compio::test]
+#[tokio::test]
 async fn head_on_an_uploaded_nar_url_reports_it_present() {
     let server = Server::start("nar-probe").await;
     let published = publish(&server, b"probe payload").await;
@@ -418,7 +420,7 @@ async fn head_on_an_uploaded_nar_url_reports_it_present() {
     assert_eq!(missing.status, 404);
 }
 
-#[compio::test]
+#[tokio::test]
 async fn a_malformed_key_dies_at_the_socket() {
     let server = Server::start("malformed").await;
     for target in
@@ -437,7 +439,7 @@ async fn a_malformed_key_dies_at_the_socket() {
     }
 }
 
-#[compio::test]
+#[tokio::test]
 async fn a_miss_is_a_404_on_both_methods() {
     let server = Server::start("miss").await;
     let key = bincache_core::hash::Sha256::digest(b"absent").base32();
@@ -450,7 +452,7 @@ async fn a_miss_is_a_404_on_both_methods() {
     }
 }
 
-#[compio::test]
+#[tokio::test]
 async fn the_write_path_refuses_what_it_cannot_verify() {
     let server = Server::start("write-refusals").await;
     let body = nar(b"verified payload");
@@ -500,7 +502,7 @@ async fn the_write_path_refuses_what_it_cannot_verify() {
 /// the one that matters most: it is the only refusal a correct client hits by being
 /// configured wrong rather than by being broken, and the fix is a URI setting nobody can
 /// guess from a bare `400`.
-#[compio::test]
+#[tokio::test]
 async fn a_client_fault_is_refused_with_its_reason() {
     let server = Server::start("refusal-bodies").await;
     let body = nar(b"refusal payload");
@@ -536,7 +538,7 @@ async fn a_client_fault_is_refused_with_its_reason() {
 
 /// Content addressing plus an idempotent publish is what makes a client retry harmless,
 /// which matters because Nix's own HTTP store has no locking.
-#[compio::test]
+#[tokio::test]
 async fn pushing_the_same_path_twice_changes_nothing() {
     let server = Server::start("idempotent").await;
     let first = publish(&server, b"idempotent payload").await;
@@ -551,7 +553,7 @@ async fn pushing_the_same_path_twice_changes_nothing() {
 /// A closure query fires hundreds of lookups at once, and `http-connections` caps
 /// connections rather than in-flight requests, so keep-alive is the difference between one
 /// handshake and hundreds.
-#[compio::test]
+#[tokio::test]
 async fn one_connection_serves_many_requests() {
     let server = Server::start("keep-alive").await;
     let published = publish(&server, b"keep-alive payload").await;
@@ -568,7 +570,7 @@ async fn one_connection_serves_many_requests() {
 
 /// A push is two requests per path, and a closure is hundreds of paths. Answering a
 /// consumed body with a close would make `nix copy` reconnect for every one of them.
-#[compio::test]
+#[tokio::test]
 async fn a_whole_push_fits_on_one_connection() {
     let server = Server::start("push-keep-alive").await;
     let mut stream = server.connect().await;
@@ -599,10 +601,15 @@ async fn a_whole_push_fits_on_one_connection() {
     }
 }
 
-/// A request whose body is refused unread must close, or the next request on the
-/// connection would start mid-message.
-#[compio::test]
-async fn a_refused_body_closes_the_connection() {
+/// A request whose body is refused unread must not leave that body to be read as the next
+/// request.
+///
+/// Closing is one way to guarantee it and draining is another, so the assertion is the
+/// invariant rather than the mechanism: either the connection ends, or the follow-up gets
+/// its own correct answer. What must never happen is a reply derived from the leftover
+/// body.
+#[tokio::test]
+async fn a_refused_body_never_becomes_the_next_request() {
     let server = Server::start("refused-body").await;
     let body = nar(b"unauthorized payload");
     let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
@@ -610,12 +617,50 @@ async fn a_refused_body_closes_the_connection() {
         "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
         body.len()
     );
-    let response = server.request(&head, &body).await;
-    assert_eq!(response.status, 401);
-    assert_eq!(response.header("Connection"), Some("close"));
+
+    let mut stream = server.connect().await;
+    let refused = exchange(&mut stream, &head, &body).await;
+    assert_eq!(refused.status, 401);
+
+    send(&mut stream, "GET /nix-cache-info HTTP/1.1\r\nHost: t\r\n\r\n", b"").await;
+    if let Some(answered) = try_read_response(&mut stream, Body::Expected).await {
+        assert_eq!(answered.status, 200, "the follow-up read the refused body");
+    }
 }
 
-#[compio::test]
+/// A refusal must land before the body does, which is the whole point of checking the
+/// target and the credential first.
+///
+/// The largest refusal is a pre-compressed multi-gigabyte NAR. If the server drained the
+/// upload before answering, a build node configured without `?compression=none` would push
+/// the whole thing across the network to be told no. The `Content-Length` here promises a
+/// body that is never sent, so an answer at all proves the server did not wait for it.
+#[tokio::test]
+async fn a_push_is_refused_without_reading_its_body() {
+    let server = Server::start("early-refusal").await;
+    let hash32 = bincache_core::hash::Sha256::digest(&nar(b"never sent")).base32();
+
+    let mut stream = server.connect().await;
+    let head = format!(
+        "PUT /nar/{hash32}.nar.zst HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+         Content-Length: 10737418240\r\n\r\n",
+        server.token
+    );
+    send(&mut stream, &head, b"").await;
+
+    let answered = tokio::time::timeout(
+        core::time::Duration::from_secs(5),
+        read_response(&mut stream, Body::Expected),
+    )
+    .await
+    .expect("the refusal must not wait for ten gigabytes that are never sent");
+
+    assert_eq!(answered.status, 400);
+    let text = String::from_utf8(answered.body).expect("the refusal is utf8");
+    assert!(text.contains("?compression=none"), "the refusal was {text:?}");
+}
+
+#[tokio::test]
 async fn a_connection_close_request_is_honoured() {
     let server = Server::start("close").await;
     let response = server
@@ -624,21 +669,78 @@ async fn a_connection_close_request_is_honoured() {
     assert_eq!(response.header("Connection"), Some("close"));
 }
 
-#[compio::test]
-async fn chunked_uploads_are_refused_rather_than_misparsed() {
-    let server = Server::start("chunked").await;
+/// RFC 9112 §6.1: when a message carries both `Transfer-Encoding` and `Content-Length`,
+/// the framing is ambiguous, `Transfer-Encoding` overrides, and a server must answer `400`
+/// and close. Two recipients that resolve the ambiguity differently disagree about where
+/// this message ends and the next one begins, which is the whole of request smuggling.
+///
+/// Everything else about this upload is valid: the token is real and the body hashes to
+/// what the target declares. The framing conflict is the only defect, so a `201` here means
+/// the server resolved the ambiguity rather than refusing it.
+#[tokio::test]
+async fn a_conflicting_framing_is_refused_rather_than_resolved() {
+    let server = Server::start("framing-conflict").await;
+    let body = nar(b"smuggled payload");
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+
     let head = format!(
-        "PUT /nar/{}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+        "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
+         Transfer-Encoding: chunked\r\nContent-Length: {}\r\n\r\n",
+        server.token,
+        body.len()
+    );
+    let response = server.request(&head, &body).await;
+    assert_eq!(response.status, 400, "an ambiguously framed request must be refused");
+    assert_eq!(response.header("Connection"), Some("close"), "and the connection must close");
+}
+
+/// A chunk-framed body must be consumed or the connection must close. Leaving it in the
+/// socket means the next request on a kept-alive connection starts mid-message, and the
+/// chunk data gets parsed as a request head.
+///
+/// The follow-up `GET` is the assertion. It is a well-formed request on a connection the
+/// server said it would keep, so anything other than `200` means the server answered the
+/// previous request's body instead.
+#[tokio::test]
+async fn a_chunked_body_does_not_desync_the_connection() {
+    let server = Server::start("chunked").await;
+    let body = nar(b"chunked payload");
+    let hash32 = bincache_core::hash::Sha256::digest(&body).base32();
+
+    let mut chunked = format!("{:x}\r\n", body.len()).into_bytes();
+    chunked.extend_from_slice(&body);
+    chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+
+    let head = format!(
+        "PUT /nar/{hash32}.nar HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {}\r\n\
          Transfer-Encoding: chunked\r\n\r\n",
-        bincache_core::hash::Sha256::digest(b"x").base32(),
         server.token
     );
-    assert_eq!(server.request(&head, b"").await.status, 501);
+
+    let mut stream = server.connect().await;
+    let upload = exchange(&mut stream, &head, &chunked).await;
+    if upload.header("Connection") == Some("close") {
+        return;
+    }
+
+    send(&mut stream, "GET /nix-cache-info HTTP/1.1\r\nHost: t\r\n\r\n", b"").await;
+    let answered = try_read_response(&mut stream, Body::Expected).await;
+    let Some(answered) = answered else {
+        panic!(
+            "the upload answered {} with Connection: keep-alive, then closed: \
+             the chunk-framed body was left in the socket and parsed as the next request",
+            upload.status
+        );
+    };
+    assert_eq!(
+        answered.status, 200,
+        "the connection was kept but the next request read the previous body"
+    );
 }
 
 /// curl sets `Expect: 100-continue` on uploads past about a kilobyte and stalls for a
 /// second if nothing answers.
-#[compio::test]
+#[tokio::test]
 async fn an_expect_continue_upload_is_answered_before_the_body() {
     let server = Server::start("expect").await;
     let body = nar(&b"expecting payload".repeat(256));
@@ -651,19 +753,17 @@ async fn an_expect_continue_upload_is_answered_before_the_body() {
         server.token,
         body.len()
     );
-    let compio::BufResult(written, _) = stream.write_all(head.into_bytes()).await;
-    written.expect("writes the head");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, head.as_bytes()).await.expect("writes");
 
     let interim = read_response(&mut stream, Body::Expected).await;
     assert_eq!(interim.status, 100, "the server invites the body before it is sent");
 
-    let compio::BufResult(written, _) = stream.write_all(body).await;
-    written.expect("writes the body");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &body).await.expect("writes the body");
     assert_eq!(read_response(&mut stream, Body::Expected).await.status, 201);
 }
 
-#[compio::test]
-async fn metrics_report_what_the_shard_counted() {
+#[tokio::test]
+async fn metrics_report_what_was_counted() {
     let server = Server::start("metrics").await;
     let published = publish(&server, b"metrics payload").await;
     server

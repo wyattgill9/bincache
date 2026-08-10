@@ -2,15 +2,8 @@
 
 use snafu::ResultExt as _;
 
-/// mimalloc specifically absorbs Compio's per-operation boxing, which Iggy measured on
-/// this runtime stack. The commonly quoted speedups are vendor benchmarks on other
-/// workloads and are not claimed here; this is a starting point to measure against, per
-/// `research/DESIGN_V2.md`.
-#[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-/// Default tracing filter. `info` covers boot, publishes, and stall reports; per-request
-/// work on the serving path emits counters rather than spans and is silent here.
+/// Default tracing filter. `info` covers boot and publishes; per-request work on the
+/// serving path emits counters rather than spans and is silent here.
 const FILTER_DEFAULT: &str = "info";
 
 #[derive(Debug, snafu::Snafu)]

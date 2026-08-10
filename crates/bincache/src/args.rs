@@ -53,7 +53,7 @@ pub struct Serve {
     #[command(flatten)]
     pub store: Store,
 
-    /// Address every shard binds with `SO_REUSEPORT`.
+    /// Address the server listens on.
     #[arg(long, env = "BINCACHE_LISTEN", default_value = "0.0.0.0:5000")]
     pub listen: std::net::SocketAddr,
 
@@ -72,15 +72,6 @@ pub struct Serve {
     #[arg(long, env = "BINCACHE_PUSH_TOKEN_FILE")]
     pub push_token_file: Option<std::path::PathBuf>,
 
-    /// Serving shards. Defaults to the parallelism the machine reports.
-    #[arg(long, env = "BINCACHE_SHARDS")]
-    pub shards: Option<core::num::NonZeroUsize>,
-
-    /// Pin each shard to a core. The point of the architecture on a dedicated box, and
-    /// the wrong default on a shared one.
-    #[arg(long, env = "BINCACHE_PIN")]
-    pub pin: bool,
-
     /// zstd level applied at ingest.
     #[arg(long, env = "BINCACHE_ZSTD_LEVEL", default_value_t = 3)]
     pub zstd_level: i32,
@@ -98,10 +89,6 @@ pub struct Serve {
     #[arg(long, env = "BINCACHE_WANT_MASS_QUERY", action = clap::ArgAction::Set,
           default_value_t = true)]
     pub want_mass_query: bool,
-
-    /// How long a shard may go without a heartbeat before the watchdog says so.
-    #[arg(long, env = "BINCACHE_STALL_SECONDS", default_value_t = 30)]
-    pub stall_seconds: u64,
 }
 
 #[derive(Debug, clap::Args)]

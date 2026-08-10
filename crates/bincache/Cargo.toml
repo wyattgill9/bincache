@@ -12,10 +12,9 @@ bincache-serve  = { workspace = true }
 bincache-store  = { workspace = true }
 
 clap               = { workspace = true }
-compio             = { workspace = true, features = ["runtime"] }
-mimalloc           = { workspace = true }
 redb               = { workspace = true }
 snafu              = { workspace = true }
+tokio              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 

@@ -8,39 +8,39 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-bytes           = { version = "1.12" }
-clap            = { version = "4.6", features = ["derive", "env"] }
-compio          = { version = "0.19", features = ["macros", "runtime"] }
-core_affinity   = { version = "0.8" }
+bytes = { version = "1.12" }
+clap = { version = "4.6", features = ["derive", "env"] }
+compio = { version = "0.19", features = ["macros", "runtime"] }
+core_affinity = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
-data-encoding   = { version = "2.9" }
-mimalloc        = { version = "0.1" }
-derive_more     = { version = "2.1", features = ["as_ref", "display", "from"] }
-ed25519-dalek   = { version = "3.0", features = ["rand_core"] }
-expect-test     = { version = "1.5" }
-rand            = { version = "0.9" }
-redb            = { version = "4.1" }
+data-encoding = { version = "2.9" }
+mimalloc = { version = "0.1" }
+derive_more = { version = "2.1", features = ["as_ref", "display", "from"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+expect-test = { version = "1.5" }
+rand = { version = "0.9" }
+redb = { version = "4.1" }
 # `unaligned` so an archive can be validated straight out of a `redb` value, which hands
 # back a byte slice at whatever alignment its page put it. `little_endian` so the on-disk
 # format does not change meaning on a big-endian or differently-tuned build.
-rkyv            = { version = "0.8", features = ["unaligned", "little_endian"] }
-sha2            = { version = "0.11" }
-snafu           = { version = "0.9" }
-socket2         = { version = "0.6" }
-strum           = { version = "0.28", features = ["derive"] }
-subtle          = { version = "2.6" }
-swrite          = { version = "0.1" }
-tracing         = { version = "0.1" }
+rkyv = { version = "0.8", features = ["unaligned", "little_endian"] }
+sha2 = { version = "0.11" }
+snafu = { version = "0.9" }
+socket2 = { version = "0.6" }
+strum = { version = "0.28", features = ["derive"] }
+subtle = { version = "2.6" }
+swrite = { version = "0.1" }
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zstd            = { version = "0.13" }
+zstd = { version = "0.13" }
 
 pretty_assertions = { version = "1.4" }
 
-bincache-core   = { path = "crates/bincache-core" }
-bincache-index  = { path = "crates/bincache-index" }
+bincache-core = { path = "crates/bincache-core" }
+bincache-index = { path = "crates/bincache-index" }
 bincache-ingest = { path = "crates/bincache-ingest" }
-bincache-serve  = { path = "crates/bincache-serve" }
-bincache-store  = { path = "crates/bincache-store" }
+bincache-serve = { path = "crates/bincache-serve" }
+bincache-store = { path = "crates/bincache-store" }
 
 [workspace.lints.rust]
 # deny (not forbid) so the buffer-pool and index crates can carve out

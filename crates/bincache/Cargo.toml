@@ -5,18 +5,18 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-bincache-core   = { workspace = true }
-bincache-index  = { workspace = true }
+bincache-core = { workspace = true }
+bincache-index = { workspace = true }
 bincache-ingest = { workspace = true }
-bincache-serve  = { workspace = true }
-bincache-store  = { workspace = true }
+bincache-serve = { workspace = true }
+bincache-store = { workspace = true }
 
-clap               = { workspace = true }
-compio             = { workspace = true, features = ["runtime"] }
-mimalloc           = { workspace = true }
-redb               = { workspace = true }
-snafu              = { workspace = true }
-tracing            = { workspace = true }
+clap = { workspace = true }
+compio = { workspace = true, features = ["runtime"] }
+mimalloc = { workspace = true }
+redb = { workspace = true }
+snafu = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
